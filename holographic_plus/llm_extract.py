@@ -1,7 +1,8 @@
 """LLM-based fact extraction at session end.
 
-Uses GPT-5.5 with xhigh reasoning to extract 3-7 atomic, durable facts
-from a conversation. Called from HolographicPlusProvider.on_session_end().
+Uses a configurable LLM — the host agent's own model by default — to extract
+3-7 atomic, durable facts from a conversation. Called from
+HolographicPlusProvider.on_session_end().
 
 Design principles:
 - Only extract facts that will still be true next week
@@ -150,8 +151,15 @@ def _run_extraction(
     messages: List[Dict[str, Any]],
     store: "MemoryStore",
     embed_callback=None,  # optional: callable(fact_id, content) to trigger embedding
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
 ) -> None:
     """Core extraction logic. Runs synchronously (called from a daemon thread)."""
+    if not provider or not model:
+        logger.debug("llm_extract: no extraction provider/model configured — skipping")
+        return
     try:
         from agent.auxiliary_client import call_llm
     except ImportError:
@@ -171,15 +179,15 @@ def _run_extraction(
 
     try:
         resp = call_llm(
-            provider="openai-codex",
-            model="gpt-5.5",
+            provider=provider,
+            model=model,
             messages=[
                 {"role": "system", "content": _SYSTEM},
                 {"role": "user",   "content": user_msg},
             ],
             max_tokens=1024,
             timeout=60,
-            extra_body={"reasoning": {"effort": "xhigh"}},
+            extra_body=({"reasoning": {"effort": effort}} if effort else None),
         )
         raw = resp.choices[0].message.content or ""
     except Exception as exc:
@@ -219,6 +227,10 @@ def extract_facts_from_session(
     store: "MemoryStore",
     embed_callback=None,
     blocking: bool = False,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
 ) -> None:
     """Public entry point. Runs extraction in a daemon thread by default.
 
@@ -228,14 +240,24 @@ def extract_facts_from_session(
         embed_callback: Optional callable(fact_id, content) — called after each
                         successful insert to trigger embedding in holographic_plus.
         blocking:       If True, run synchronously (for testing). Default: False.
+        provider/model: LLM to extract with. The provider resolves these from
+                        config (``extraction_provider`` / ``extraction_model``),
+                        defaulting to the host agent's own model. Extraction is
+                        skipped if neither is set.
+        effort:         Optional reasoning-effort hint, passed via extra_body only
+                        when set so non-reasoning providers are unaffected.
     """
+    if not provider or not model:
+        logger.debug("llm_extract: extraction provider/model not configured — skipping")
+        return
     if blocking:
-        _run_extraction(messages, store, embed_callback)
+        _run_extraction(messages, store, embed_callback, provider=provider, model=model, effort=effort)
         return
 
     t = threading.Thread(
         target=_run_extraction,
         args=(messages, store, embed_callback),
+        kwargs={"provider": provider, "model": model, "effort": effort},
         daemon=True,
         name="llm_fact_extract",
     )

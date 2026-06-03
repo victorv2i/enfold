@@ -1,23 +1,26 @@
 """holographic_plus — Holographic memory with dense embedding retrieval.
 
 Extends HolographicMemoryProvider with a 4th retrieval signal: dense cosine
-similarity via Ollama qwen3-embedding:8b (4096-dim vectors).
+similarity. The embedder is pluggable — FastEmbed (local CPU, the default) or
+Ollama — and durable facts are extracted at session end by a configurable LLM
+(the host agent's own model by default).
 
 Config (same ``plugins.hermes-memory-store`` block, extra keys):
 
     plugins:
       hermes-memory-store:
         # ... all existing holographic keys ...
-        embedding_weight: 0.3        # weight for embedding similarity (default 0.3)
-        ollama_url: http://localhost:11434
-        ollama_model: qwen3-embedding:8b
-        embed_on_add: true           # embed immediately when a fact is added (default true)
+        embedding_weight: 0.3            # weight for embedding similarity (default 0.3)
+        embedding_backend: fastembed     # "fastembed" (local CPU, default) or "ollama"
+        fastembed_model: BAAI/bge-base-en-v1.5
+        embed_on_add: true               # embed immediately when a fact is added (default true)
+        # extraction_provider / extraction_model: default to the host agent's model
 
 Retrieval weights (must sum to ≤ 1.0; remainder goes to trust scaling):
     FTS=0.3, Jaccard=0.2, HRR=0.2, Embedding=0.3
 
-If Ollama is unreachable the plugin falls back silently to holographic-only
-scoring (embedding weight redistributed proportionally to the other three).
+If the embedding backend is unreachable the plugin falls back silently to
+holographic-only scoring (embedding weight redistributed to the other three).
 
 First-run behaviour:
     On initialize(), any fact that lacks an embedding is queued for batch
@@ -58,19 +61,26 @@ _PARENT_HRR_W     = _HRR_W    / (1.0 - _EMBED_W)    # ≈ 0.2857
 
 
 class HolographicPlusProvider(HolographicMemoryProvider):
-    """Holographic memory + dense embedding retrieval via Ollama."""
+    """Holographic memory + dense embedding retrieval (FastEmbed or Ollama)."""
 
     def __init__(self, config: dict | None = None) -> None:
         super().__init__(config=config)
         cfg = self._config
         self._embed_weight: float = float(cfg.get("embedding_weight", _EMBED_W))
-        self._embedding_backend: str = str(cfg.get("embedding_backend", "ollama")).lower()
+        self._embedding_backend: str = str(cfg.get("embedding_backend", "fastembed")).lower()
         self._embedding_prefix_policy: str = str(cfg.get("embedding_prefix_policy", "none"))
         self._ollama_url: str     = str(cfg.get("ollama_url", "http://localhost:11434"))
         self._ollama_model: str   = str(cfg.get("ollama_model", "qwen3-embedding:8b"))
         self._fastembed_model: str = str(cfg.get("fastembed_model", "BAAI/bge-base-en-v1.5"))
         self._fastembed_cache_dir: Optional[str] = cfg.get("fastembed_cache_dir")
         self._embed_on_add: bool  = bool(cfg.get("embed_on_add", True))
+
+        # Fact-extraction LLM: explicit override, else the host agent's own model,
+        # else disabled. Never hardcodes a provider — works with whatever the user runs.
+        _host_model = _host_model_config()
+        self._extract_provider: Optional[str] = cfg.get("extraction_provider") or _host_model.get("provider")
+        self._extract_model: Optional[str]    = cfg.get("extraction_model") or _host_model.get("default")
+        self._extract_effort: Optional[str]   = cfg.get("extraction_effort")
 
         self._embedder: Optional[Any] = None
         self._embed_store: Optional[EmbedStore]  = None
@@ -189,7 +199,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         self._embed_store = None
 
     # ------------------------------------------------------------------
-    # Session end — LLM-based fact extraction (GPT-5.5 xhigh)
+    # Session end — LLM-based fact extraction (configurable model)
     # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
@@ -235,6 +245,8 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             from agent.auxiliary_client import call_llm
         except ImportError:
             return
+        if not self._extract_provider or not self._extract_model:
+            return
 
         from .llm_extract import _format_conversation, _existing_summary, _parse_response
 
@@ -265,15 +277,15 @@ RULES:
 
         try:
             resp = call_llm(
-                provider="openai-codex",
-                model="gpt-5.5",
+                provider=self._extract_provider,
+                model=self._extract_model,
                 messages=[
                     {"role": "system", "content": _COMPRESS_SYSTEM},
                     {"role": "user",   "content": user_msg},
                 ],
                 max_tokens=512,
                 timeout=30,
-                extra_body={"reasoning": {"effort": "xhigh"}},
+                extra_body=({"reasoning": {"effort": self._extract_effort}} if self._extract_effort else None),
             )
             raw = resp.choices[0].message.content or ""
         except Exception as exc:
@@ -316,7 +328,7 @@ RULES:
         """At session end: run regex auto-extract (parent) then LLM extraction.
 
         Parent handles cheap regex patterns (I prefer X, we decided Y).
-        We then run GPT-5.5 with xhigh reasoning to catch everything else.
+        We then run an LLM pass (the host agent's model by default) to catch everything else.
         Runs in a daemon thread — never blocks session teardown.
         """
         # Run parent regex extraction first (fast, cheap, synchronous)
@@ -336,6 +348,9 @@ RULES:
             store=self._store,
             embed_callback=_embed_cb,
             blocking=False,
+            provider=self._extract_provider,
+            model=self._extract_model,
+            effort=self._extract_effort,
         )
 
     # ------------------------------------------------------------------
@@ -722,6 +737,23 @@ RULES:
 # ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
+
+def _host_model_config() -> dict:
+    """Read the host agent's model config (``model.provider`` + ``model.default``)
+    so fact extraction can default to whatever model the user's Hermes already
+    runs on — never a hardcoded provider. Returns {} if unavailable."""
+    try:
+        from hermes_constants import get_hermes_home
+        config_path = get_hermes_home() / "config.yaml"
+        if not config_path.exists():
+            return {}
+        import yaml
+        with open(config_path) as f:
+            all_config = yaml.safe_load(f) or {}
+        return all_config.get("model", {}) or {}
+    except Exception:
+        return {}
+
 
 def _load_plugin_config() -> dict:
     from hermes_constants import get_hermes_home

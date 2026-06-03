@@ -10,7 +10,7 @@ It does not replace the holographic provider — it subclasses it. All the holog
 
 - **Dense embedding retrieval.** Each fact is embedded into a sidecar `fact_embeddings` table; queries are scored by cosine similarity. This catches paraphrases and fuzzy matches that pure keyword/FTS search misses.
 - **Hybrid scoring.** Four signals merged per query — FTS keyword, Jaccard overlap, HRR compositional, and dense embedding — with the remaining budget going to trust weighting. Default split: FTS 0.3, Jaccard 0.2, HRR 0.2, embedding 0.3.
-- **LLM fact extraction.** At session end (and just before context compression) it extracts durable, atomic facts from the conversation so nothing important is lost when the window rolls over.
+- **LLM fact extraction.** At session end (and just before context compression) it extracts durable, atomic facts from the conversation so nothing important is lost when the window rolls over. Extraction uses your agent's own model by default — no hardcoded provider — and is configurable.
 - **Graceful fallback.** If the embedding backend is unreachable, it silently falls back to holographic-only scoring with the embedding weight redistributed — never a hard failure.
 
 ## Requirements
@@ -43,12 +43,18 @@ Under `plugins.hermes-memory-store` in `config.yaml` — every base holographic 
 ```yaml
 plugins:
   hermes-memory-store:
-    embedding_backend: fastembed            # "fastembed" (local CPU) or "ollama"
+    embedding_backend: fastembed            # "fastembed" (local CPU, default) or "ollama"
     embedding_weight: 0.3                   # weight of dense similarity in the hybrid score
     embed_on_add: true                      # embed a fact immediately when it is added
     fastembed_model: BAAI/bge-base-en-v1.5  # 768-dim, local
     ollama_url: http://localhost:11434      # only if embedding_backend: ollama
-    ollama_model: qwen3-embedding:8b
+    ollama_model: qwen3-embedding:8b        # only if embedding_backend: ollama
+    # Fact extraction is optional and defaults to your agent's own model
+    # (config.yaml `model.provider` + `model.default`). Override only to use a
+    # different model than the agent runs on:
+    # extraction_provider: <provider>
+    # extraction_model: <model>
+    # extraction_effort: high               # only if your provider supports reasoning effort
 ```
 
 Embeddings are **identity-versioned** (`backend:model:role:vN`), so switching models never corrupts existing vectors — stale ones are simply re-embedded on the next backfill. On startup, any fact missing an embedding is backfilled in a non-blocking background thread (in batches).
