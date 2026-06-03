@@ -26,7 +26,7 @@ It does not replace the holographic provider — it subclasses it. All the holog
 Hermes auto-discovers any memory-provider directory under `~/.hermes/plugins/`, so installation is a copy:
 
 ```bash
-git clone https://github.com/<your-handle>/holographic-plus.git
+git clone https://github.com/victorv2i/holographic-plus.git
 cp -r holographic-plus/holographic_plus ~/.hermes/plugins/
 ```
 
