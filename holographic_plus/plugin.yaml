@@ -1,0 +1,5 @@
+name: holographic_plus
+version: 0.1.0
+description: "Holographic+ memory — local holographic SQLite fact store with FastEmbed dense retrieval."
+hooks:
+  - on_session_end
