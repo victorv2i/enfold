@@ -166,7 +166,7 @@ def main() -> int:
     header = f"{'retriever':<12} {'recall@1':>9} {'recall@3':>9} {'recall@5':>9} {'MRR':>7}"
     print(header)
     print("-" * len(header))
-    for label, ranked in (("keyword", kw_ranked), ("embedding", emb_ranked), ("hybrid", hyb_ranked)):
+    for label, ranked in (("keyword", kw_ranked), ("embedding", emb_ranked), ("blend*", hyb_ranked)):
         print(
             f"{label:<12} "
             f"{_recall_at_k(ranked, targets, 1):>9.2f} "
@@ -174,6 +174,11 @@ def main() -> int:
             f"{_recall_at_k(ranked, targets, 5):>9.2f} "
             f"{_mrr(ranked, targets):>7.2f}"
         )
+    print(
+        "\n* 'blend' is an illustrative keyword+embedding mix (min-max normalised, 0.4/0.6) "
+        "for this isolated comparison. It is NOT the shipped scorer: the plugin adds the "
+        "trust-weighted embedding onto the trust-weighted holographic score (FTS+Jaccard+HRR)."
+    )
     return 0
 
 

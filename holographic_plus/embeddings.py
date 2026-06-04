@@ -81,34 +81,40 @@ class OllamaEmbedder:
     def embed_batch(self, texts: List[str]) -> List[Optional[np.ndarray]]:
         """Embed a list of texts, returning one vector (or None) per text.
 
-        Modern Ollama accepts list input for /api/embed. Use it when possible
-        and fall back to sequential calls if a local build rejects it.
+        Blank/whitespace inputs map to None without hitting the server, so the
+        result is position-equivalent to calling embed() on each item. Modern
+        Ollama accepts list input for /api/embed; falls back to sequential calls
+        if a local build rejects it.
         """
         if not texts:
             return []
-        payload = json.dumps({"model": self.model, "input": texts}).encode()
+        send_idx = [i for i, t in enumerate(texts) if t and t.strip()]
+        if not send_idx:
+            return [None for _ in texts]
+        send_texts = [texts[i] for i in send_idx]
+        payload = json.dumps({"model": self.model, "input": send_texts}).encode()
         req = urllib.request.Request(
             self._embed_url,
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        result: List[Optional[np.ndarray]] = [None] * len(texts)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 data = json.loads(resp.read().decode())
             embeddings = data.get("embeddings")
-            if isinstance(embeddings, list) and len(embeddings) == len(texts):
-                result: List[Optional[np.ndarray]] = []
-                for raw in embeddings:
+            if isinstance(embeddings, list) and len(embeddings) == len(send_texts):
+                for pos, raw in zip(send_idx, embeddings):
                     if not raw:
-                        result.append(None)
                         continue
                     vec = np.array(raw, dtype=np.float32)
                     norm = np.linalg.norm(vec)
                     if norm > 0:
                         vec /= norm
-                    result.append(vec)
+                    result[pos] = vec
                 return result
+            logger.debug("Ollama batch embed: length mismatch, falling back to sequential")
         except Exception as exc:
             logger.debug("Ollama batch embed request failed, falling back: %s", exc)
         return [self.embed(t) for t in texts]
@@ -192,8 +198,16 @@ class FastEmbedder:
         client = self._client()
         if client is None:
             return [None for _ in texts]
+        # Blank inputs map to None without hitting the model (matches embed()).
+        send_idx = [i for i, t in enumerate(texts) if t and t.strip()]
+        if not send_idx:
+            return [None for _ in texts]
+        send_texts = [texts[i] for i in send_idx]
+        result: List[Optional[np.ndarray]] = [None] * len(texts)
         try:
-            return [self._normalise(raw) for raw in client.embed(texts)]
+            for pos, raw in zip(send_idx, client.embed(send_texts)):
+                result[pos] = self._normalise(raw)
+            return result
         except Exception as exc:
             logger.debug("FastEmbed batch embed failed: %s", exc)
             return [self.embed(t) for t in texts]
@@ -207,13 +221,17 @@ class FastEmbedder:
 # ---------------------------------------------------------------------------
 
 def embedding_to_bytes(vec: np.ndarray) -> bytes:
-    """Serialize a float32 numpy vector to raw bytes for SQLite BLOB storage."""
-    return vec.astype(np.float32).tobytes()
+    """Serialize a float32 numpy vector to raw bytes for SQLite BLOB storage.
+
+    Uses an explicit little-endian dtype so a database written on one CPU
+    architecture reads back correctly on another.
+    """
+    return np.asarray(vec, dtype="<f4").tobytes()
 
 
 def bytes_to_embedding(blob: bytes) -> np.ndarray:
-    """Deserialize a float32 BLOB from SQLite into a numpy vector."""
-    return np.frombuffer(blob, dtype=np.float32).copy()
+    """Deserialize a little-endian float32 BLOB from SQLite into a numpy vector."""
+    return np.frombuffer(blob, dtype="<f4").astype(np.float32, copy=True)
 
 
 # ---------------------------------------------------------------------------

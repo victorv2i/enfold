@@ -37,6 +37,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from plugins.memory.holographic import HolographicMemoryProvider
@@ -58,6 +59,23 @@ _EMBED_W   = 0.3
 _PARENT_FTS_W     = _FTS_W     / (1.0 - _EMBED_W)   # ≈ 0.4286
 _PARENT_JACCARD_W = _JACCARD_W / (1.0 - _EMBED_W)   # ≈ 0.2857
 _PARENT_HRR_W     = _HRR_W    / (1.0 - _EMBED_W)    # ≈ 0.2857
+
+
+def _blend_score(holo_score: float, raw_emb_sim: Optional[float], trust: float, ew: float) -> float:
+    """Combine the holographic score and the dense-embedding similarity on one scale.
+
+    ``holo_score`` is the parent's relevance × trust (range ``[0, trust]``), with the
+    parent's FTS/Jaccard/HRR weights rescaled to sum to 1.0. The holographic signals
+    share a ``(1 - ew)`` slice of the budget and the embedding gets ``ew``. The cosine
+    similarity is mapped ``[-1, 1] → [0, 1]`` and likewise trust-weighted, so both
+    terms live in ``[0, trust]`` and the weights genuinely partition the budget. A
+    fact with no embedding simply cannot earn the ``ew`` slice.
+    """
+    base = (1.0 - ew) * holo_score
+    if raw_emb_sim is None:
+        return base
+    emb_norm = (raw_emb_sim + 1.0) / 2.0  # cosine [-1,1] → [0,1]
+    return base + ew * emb_norm * trust
 
 
 class HolographicPlusProvider(HolographicMemoryProvider):
@@ -84,8 +102,9 @@ class HolographicPlusProvider(HolographicMemoryProvider):
 
         self._embedder: Optional[Any] = None
         self._embed_store: Optional[EmbedStore]  = None
-        self._ollama_available: bool             = False
+        self._embedder_available: bool             = False
         self._backfill_thread: Optional[threading.Thread] = None
+        self._embed_pool: Optional[ThreadPoolExecutor] = None
 
     # ------------------------------------------------------------------
     # Embedding backend helpers
@@ -127,25 +146,14 @@ class HolographicPlusProvider(HolographicMemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize parent store + embedding layer."""
-        # ---- Adjust parent retrieval weights so HRR+FTS+Jaccard use remaining budget
-        # We pass our reduced weights so the parent FactRetriever's combined score
-        # represents (1 - embed_weight) of the total budget.
         ew = self._embed_weight
         remaining = max(0.0, 1.0 - ew)
-        # Scale parent weights proportionally so they fill the remaining budget
-        cfg_override = dict(self._config)
-        # FactRetriever picks these up via hrr_weight key in config... but actually
-        # the parent passes them directly to FactRetriever. We set them in config so
-        # our overridden initialize() can forward them.
-        cfg_override.setdefault("hrr_weight", round(_HRR_W / remaining, 6) if remaining else 0.0)
-
-        # Store the original config reference, swap temporarily
-        _orig_config = self._config
-        self._config = cfg_override
         super().initialize(session_id, **kwargs)
-        self._config = _orig_config  # restore
 
-        # ---- Re-create FactRetriever with correct scaled weights
+        # ---- Re-build FactRetriever so FTS/Jaccard/HRR share the (1 - embed_weight)
+        #      budget: their weights are rescaled to sum to 1.0 here, and the
+        #      embedding signal is folded in at merge time (see search()/_blend_score),
+        #      where the (1-ew)/ew split keeps every signal on a consistent scale.
         hrr_dim = int(self._config.get("hrr_dim", 1024))
         temporal_decay = int(self._config.get("temporal_decay_half_life", 0))
 
@@ -171,10 +179,12 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         self._embed_store = EmbedStore(
             conn=self._store._conn,
             embedding_identity=self._embedding_identity("document"),
+            lock=getattr(self._store, "_lock", None),
         )
-        self._ollama_available = self._embedder.is_available()
+        self._embed_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="hp-embed")
+        self._embedder_available = self._embedder.is_available()
 
-        if self._ollama_available:
+        if self._embedder_available:
             logger.info(
                 "holographic_plus: embedding backend available (%s, model=%s)",
                 self._embedding_backend, self._embedding_model_name(),
@@ -195,6 +205,9 @@ class HolographicPlusProvider(HolographicMemoryProvider):
 
     def shutdown(self) -> None:
         super().shutdown()
+        if self._embed_pool is not None:
+            self._embed_pool.shutdown(wait=False)
+            self._embed_pool = None
         self._embedder    = None
         self._embed_store = None
 
@@ -297,7 +310,7 @@ RULES:
             return
 
         def _embed_cb(fact_id: int, content: str) -> None:
-            if self._ollama_available and self._embedder and self._embed_store:
+            if self._embedder_available and self._embedder and self._embed_store:
                 self._embed_and_store(fact_id, content)
 
         inserted = 0
@@ -310,11 +323,7 @@ RULES:
                 )
                 inserted += 1
                 if fact_id:
-                    threading.Thread(
-                        target=_embed_cb,
-                        args=(fact_id, fact["content"]),
-                        daemon=True,
-                    ).start()
+                    self._submit_embed(_embed_cb, fact_id, fact["content"])
             except Exception as exc:
                 logger.debug("holographic_plus: pre-compress add_fact failed: %s", exc)
 
@@ -340,7 +349,7 @@ RULES:
 
         # Build embed callback so new facts get embedded immediately
         def _embed_cb(fact_id: int, content: str) -> None:
-            if self._ollama_available and self._embedder and self._embed_store:
+            if self._embedder_available and self._embedder and self._embed_store:
                 self._embed_and_store(fact_id, content)
 
         extract_facts_from_session(
@@ -380,19 +389,14 @@ RULES:
         try:
             if action == "add" and self._embed_on_add:
                 fact_id = result.get("fact_id")
-                if fact_id and self._ollama_available and self._embed_store:
+                if fact_id and self._embedder_available and self._embed_store:
                     content = args.get("content", "")
-                    threading.Thread(
-                        target=self._embed_and_store,
-                        args=(fact_id, content),
-                        daemon=True,
-                        name=f"embed_fact_{fact_id}",
-                    ).start()
+                    self._submit_embed(self._embed_and_store, fact_id, content)
 
             elif action == "update" and result.get("updated") and args.get("content"):
                 fact_id = int(args["fact_id"])
                 content = args.get("content", "")
-                if self._ollama_available and self._embedder and self._embed_store:
+                if self._embedder_available and self._embedder and self._embed_store:
                     self._embed_and_store(fact_id, content)
                 elif self._embed_store:
                     # Content changed but embeddings are unavailable; remove the stale vector.
@@ -408,18 +412,16 @@ RULES:
         """Mirror built-in memory writes + embed them."""
         super().on_memory_write(action, target, content)
 
-        if action == "add" and self._embed_on_add and content and self._ollama_available:
-            # Find the fact_id that was just inserted
+        if action == "add" and self._embed_on_add and content and self._embedder_available:
+            # Find the fact_id that was just inserted (content is UNIQUE in the
+            # parent schema, so this resolves to exactly one row).
             try:
-                row = self._store._conn.execute(
-                    "SELECT fact_id FROM facts WHERE content = ?", (content.strip(),)
-                ).fetchone()
+                with self._store._lock:
+                    row = self._store._conn.execute(
+                        "SELECT fact_id FROM facts WHERE content = ?", (content.strip(),)
+                    ).fetchone()
                 if row:
-                    threading.Thread(
-                        target=self._embed_and_store,
-                        args=(int(row["fact_id"]), content),
-                        daemon=True,
-                    ).start()
+                    self._submit_embed(self._embed_and_store, int(row["fact_id"]), content)
             except Exception as exc:
                 logger.debug("holographic_plus: on_memory_write embed failed: %s", exc)
 
@@ -472,7 +474,7 @@ RULES:
             limit=limit * 3,
         )
 
-        if not self._ollama_available or not self._embed_store or not self._embedder:
+        if not self._embedder_available or not self._embed_store or not self._embedder:
             # Pure holographic fallback
             for r in holo_results[:limit]:
                 r["embedding_score"] = None
@@ -520,16 +522,17 @@ RULES:
         extra_facts: List[Dict[str, Any]] = []
         if extra_ids and self._store:
             placeholders = ",".join("?" * len(extra_ids))
-            rows = self._store._conn.execute(
-                f"""
-                SELECT fact_id, content, category, tags, trust_score,
-                       retrieval_count, helpful_count, created_at, updated_at
-                FROM facts
-                WHERE fact_id IN ({placeholders})
-                  AND trust_score >= ?
-                """,
-                list(extra_ids) + [min_trust],
-            ).fetchall()
+            with self._store._lock:
+                rows = self._store._conn.execute(
+                    f"""
+                    SELECT fact_id, content, category, tags, trust_score,
+                           retrieval_count, helpful_count, created_at, updated_at
+                    FROM facts
+                    WHERE fact_id IN ({placeholders})
+                      AND trust_score >= ?
+                    """,
+                    list(extra_ids) + [min_trust],
+                ).fetchall()
             for row in rows:
                 d = dict(row)
                 d["score"] = 0.0  # no holographic score
@@ -539,19 +542,12 @@ RULES:
 
         for fact in all_candidates:
             fid = fact["fact_id"]
-            holo_score = fact.get("score", 0.0)   # trust-weighted holographic score
+            holo_score = fact.get("score", 0.0)  # parent relevance × trust, in [0, trust]
+            trust = float(fact.get("trust_score", fact.get("trust", 0.0)) or 0.0)
             raw_emb_sim = emb_scores.get(fid)
 
-            if raw_emb_sim is not None:
-                # Shift [-1,1] → [0,1] then weight
-                emb_contribution = ew * (raw_emb_sim + 1.0) / 2.0
-                # Holographic contribution (already scaled by 1-ew inside FactRetriever)
-                # We add the embedding on top of the existing trust-weighted score
-                fact["score"] = holo_score + emb_contribution
-                fact["embedding_score"] = round(raw_emb_sim, 4)
-            else:
-                fact["embedding_score"] = None
-                # No embedding — don't penalise, just keep holographic score
+            fact["score"] = _blend_score(holo_score, raw_emb_sim, trust, ew)
+            fact["embedding_score"] = round(raw_emb_sim, 4) if raw_emb_sim is not None else None
 
             merged.append(fact)
 
@@ -599,15 +595,16 @@ RULES:
 
         Returns stats dict with: total, embedded, skipped, elapsed_sec.
         """
-        if not self._ollama_available or not self._embedder or not self._embed_store:
-            return {"error": "Ollama not available", "total": 0, "embedded": 0}
+        if not self._embedder_available or not self._embedder or not self._embed_store:
+            return {"error": "embedding backend not available", "total": 0, "embedded": 0}
 
         if not self._store:
             return {"error": "Store not initialized", "total": 0, "embedded": 0}
 
-        rows = self._store._conn.execute(
-            "SELECT fact_id, content FROM facts ORDER BY fact_id"
-        ).fetchall()
+        with self._store._lock:
+            rows = self._store._conn.execute(
+                "SELECT fact_id, content FROM facts ORDER BY fact_id"
+            ).fetchall()
 
         total = len(rows)
         embedded = 0
@@ -654,6 +651,24 @@ RULES:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _submit_embed(self, fn, *args) -> None:
+        """Run an embedding task on the bounded pool (caps concurrent embeds).
+
+        Falls back to running inline if the pool is absent or already shutting
+        down, so a fact is never silently lost.
+        """
+        pool = self._embed_pool
+        if pool is not None:
+            try:
+                pool.submit(fn, *args)
+                return
+            except RuntimeError:
+                pass  # pool shut down mid-flight; fall through to inline
+        try:
+            fn(*args)
+        except Exception as exc:
+            logger.debug("holographic_plus: inline embed fallback failed: %s", exc)
+
     def _embed_and_store(self, fact_id: int, content: str) -> None:
         """Compute embedding for one fact and persist it (runs in a thread)."""
         try:
@@ -676,9 +691,10 @@ RULES:
             if not self._store or not self._embed_store or not self._embedder:
                 return
 
-            rows = self._store._conn.execute(
-                "SELECT fact_id, content FROM facts ORDER BY fact_id"
-            ).fetchall()
+            with self._store._lock:
+                rows = self._store._conn.execute(
+                    "SELECT fact_id, content FROM facts ORDER BY fact_id"
+                ).fetchall()
 
             all_ids = [int(r["fact_id"]) for r in rows]
             missing_ids = self._embed_store.ids_without_embeddings(

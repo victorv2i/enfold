@@ -81,10 +81,10 @@ retriever     recall@1  recall@3  recall@5     MRR
 --------------------------------------------------
 keyword           0.38      0.56      0.62    0.51
 embedding         0.81      0.88      0.88    0.86
-hybrid            0.81      0.88      0.88    0.86
+blend*            0.81      0.88      0.88    0.86
 ```
 
-The dense-embedding layer roughly doubles recall@1 over keyword (0.38 → 0.81) on paraphrased queries — the exact case where keyword search fails. On this paraphrase-heavy set the hybrid matches pure embedding (keyword adds no extra lift here); the keyword and HRR signals earn their weight on literal and compositional queries, which this benchmark intentionally underweights. It is a synthetic, illustrative benchmark, not a production guarantee — but every number is reproducible from the script.
+The dense-embedding layer roughly doubles recall@1 over keyword (0.38 → 0.81) on paraphrased queries — the exact case where keyword search fails. `*` The `blend` row is an *illustrative* keyword+embedding mix for this isolated comparison; it is **not** the formula the plugin ships. The real scorer adds the trust-weighted embedding onto the trust-weighted holographic score across FTS+Jaccard+HRR (see `_blend_score`). The keyword and HRR signals earn their weight on literal and compositional queries, which this benchmark intentionally underweights. It is a synthetic, illustrative benchmark, not a production guarantee — but every number is reproducible from the script.
 
 ## Credits
 

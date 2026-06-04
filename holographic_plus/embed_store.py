@@ -62,9 +62,17 @@ class EmbedStore:
     connection avoids locking issues on WAL-mode databases.
     """
 
-    def __init__(self, conn: sqlite3.Connection, embedding_identity: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        embedding_identity: Optional[str] = None,
+        lock: Optional["threading.RLock"] = None,
+    ) -> None:
         self._conn = conn
-        self._lock = threading.RLock()
+        # Share the parent store's lock when provided so embedding writes and the
+        # parent's fact writes serialize on the same connection (the RLock is
+        # reentrant, so nesting is safe). Falls back to a private lock for tests.
+        self._lock = lock if lock is not None else threading.RLock()
         self._embedding_identity = embedding_identity
         self._cache_ids: Optional[np.ndarray] = None
         self._cache_matrix: Optional[np.ndarray] = None
@@ -179,11 +187,24 @@ class EmbedStore:
     # Read
     # ------------------------------------------------------------------
 
-    def get(self, fact_id: int) -> Optional[np.ndarray]:
-        """Return the embedding for *fact_id*, or None if absent."""
-        row = self._conn.execute(
-            "SELECT embedding FROM fact_embeddings WHERE fact_id = ?", (fact_id,)
-        ).fetchone()
+    def get(self, fact_id: int, embedding_identity: Optional[str] = None) -> Optional[np.ndarray]:
+        """Return the embedding for *fact_id*, or None if absent.
+
+        With identity-scoped rows a fact may hold several vectors; pass
+        *embedding_identity* (or rely on the store default) to select the right
+        one rather than an arbitrary row.
+        """
+        identity = self._identity_for_storage(embedding_identity)
+        with self._lock:
+            if identity:
+                row = self._conn.execute(
+                    "SELECT embedding FROM fact_embeddings WHERE fact_id = ? AND embedding_identity = ?",
+                    (fact_id, identity),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT embedding FROM fact_embeddings WHERE fact_id = ?", (fact_id,)
+                ).fetchone()
         if row is None:
             return None
         return bytes_to_embedding(row[0])

@@ -17,7 +17,7 @@ import json
 import logging
 import re
 import threading
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
     from plugins.memory.holographic.store import MemoryStore
@@ -116,35 +116,77 @@ def _existing_summary(store: "MemoryStore", limit: int = 40) -> str:
         return "(unavailable)"
 
 
-def _parse_response(raw: str) -> List[Dict[str, str]]:
-    """Parse LLM response into a list of fact dicts. Tolerant of minor formatting issues."""
-    raw = raw.strip()
-    # Strip markdown fences if model added them anyway
-    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
-    raw = raw.strip()
+def _extract_json_array(text: str) -> Optional[str]:
+    """Return the first balanced top-level ``[...]`` block in *text*, or None.
 
+    Bracket-balanced and string-literal aware, so it survives ```json fences and
+    any leading/trailing prose (a very common LLM output shape) without being
+    confused by brackets that appear inside a fact's content.
+    """
+    start = text.find("[")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _parse_response(raw: str) -> List[Dict[str, str]]:
+    """Parse an LLM response into a list of fact dicts.
+
+    Tolerant of ```json fences and of prose before or after the JSON array: it
+    tries a direct parse, then falls back to the first balanced top-level
+    ``[...]`` block so trailing/leading text never drops a valid extraction.
+    """
+    raw = raw.strip()
     try:
         parsed = json.loads(raw)
-        if not isinstance(parsed, list):
-            logger.debug("llm_extract: response is not a list: %r", raw[:200])
+    except json.JSONDecodeError:
+        block = _extract_json_array(raw)
+        if block is None:
+            logger.debug("llm_extract: no JSON array in response: %r", raw[:200])
             return []
-        validated = []
-        for item in parsed:
-            if not isinstance(item, dict):
-                continue
-            content = str(item.get("content", "")).strip()
-            category = str(item.get("category", "general")).strip()
-            tags = str(item.get("tags", "")).strip()
-            if not content or len(content) < 10:
-                continue
-            if category not in ("user_pref", "project", "tool", "general"):
-                category = "general"
-            validated.append({"content": content[:400], "category": category, "tags": tags})
-        return validated
-    except json.JSONDecodeError as exc:
-        logger.debug("llm_extract: JSON parse failed (%s) on: %r", exc, raw[:300])
+        try:
+            parsed = json.loads(block)
+        except json.JSONDecodeError as exc:
+            logger.debug("llm_extract: JSON parse failed (%s) on: %r", exc, block[:300])
+            return []
+
+    if not isinstance(parsed, list):
+        logger.debug("llm_extract: response is not a list: %r", str(parsed)[:200])
         return []
+    validated = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content", "")).strip()
+        category = str(item.get("category", "general")).strip()
+        tags = str(item.get("tags", "")).strip()
+        if not content or len(content) < 10:
+            continue
+        if category not in ("user_pref", "project", "tool", "general"):
+            category = "general"
+        validated.append({"content": content[:400], "category": category, "tags": tags})
+    return validated
 
 
 def _run_extraction(
