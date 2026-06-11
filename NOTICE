@@ -7,9 +7,9 @@ and merges all signals in a single hybrid retrieval pass.
 
 This project builds on prior work, gratefully credited:
 
-- The base holographic memory provider — the `MemoryProvider` integration, the
+- The base holographic memory provider (the `MemoryProvider` integration, the
   HRR (Holographic Reduced Representations) retrieval, the SQLite fact store,
-  trust scoring, and entity resolution — was created by **dusterbloom** for
+  trust scoring, and entity resolution) was created by **dusterbloom** for
   NousResearch/hermes-agent (PR #2351) and is licensed MIT. holographic_plus
   subclasses it; all credit for the holographic foundation is theirs.
 
@@ -18,8 +18,9 @@ This project builds on prior work, gratefully credited:
   Representations," IEEE Transactions on Neural Networks, 6(3):623-641, 1995.
 
 The original contributions of this project are the dense embedding retrieval
-layer (`embeddings.py`, `embed_store.py`), the LLM-based fact extraction
-(`llm_extract.py`), and the hybrid scoring that merges dense similarity with
-the holographic signals.
+layer (`embeddings.py`, `embed_store.py`), the LLM-based fact extraction and
+its persistent queue (`llm_extract.py`, `extract_queue.py`), the optimized
+retriever (`retrieval_plus.py`), and the hybrid scoring that merges dense
+similarity with the holographic signals.
 
 Copyright (c) 2026 Victor Iglesias. Released under the MIT License (see LICENSE).
