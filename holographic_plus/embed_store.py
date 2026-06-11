@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -187,35 +187,6 @@ class EmbedStore:
     # Read
     # ------------------------------------------------------------------
 
-    def get(self, fact_id: int, embedding_identity: Optional[str] = None) -> Optional[np.ndarray]:
-        """Return the embedding for *fact_id*, or None if absent.
-
-        With identity-scoped rows a fact may hold several vectors; pass
-        *embedding_identity* (or rely on the store default) to select the right
-        one rather than an arbitrary row.
-        """
-        identity = self._identity_for_storage(embedding_identity)
-        with self._lock:
-            if identity:
-                row = self._conn.execute(
-                    "SELECT embedding FROM fact_embeddings WHERE fact_id = ? AND embedding_identity = ?",
-                    (fact_id, identity),
-                ).fetchone()
-            else:
-                row = self._conn.execute(
-                    "SELECT embedding FROM fact_embeddings WHERE fact_id = ?", (fact_id,)
-                ).fetchone()
-        if row is None:
-            return None
-        return bytes_to_embedding(row[0])
-
-    def get_all(self) -> Dict[int, np.ndarray]:
-        """Return a dict mapping fact_id -> embedding for all stored embeddings."""
-        rows = self._conn.execute(
-            "SELECT fact_id, embedding FROM fact_embeddings"
-        ).fetchall()
-        return {int(r[0]): bytes_to_embedding(r[1]) for r in rows}
-
     def ids_without_embeddings(self, all_fact_ids: List[int], embedding_identity: Optional[str] = None) -> List[int]:
         """Return the subset of *all_fact_ids* that have no stored embedding."""
         if not all_fact_ids:
@@ -238,13 +209,6 @@ class EmbedStore:
             ).fetchall()
             have_embeddings = {int(r[0]) for r in rows}
             return [fid for fid in all_fact_ids if fid not in have_embeddings]
-
-    def count(self) -> int:
-        """Return the number of stored embeddings."""
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM fact_embeddings"
-        ).fetchone()
-        return int(row[0])
 
     # ------------------------------------------------------------------
     # Scoring helpers

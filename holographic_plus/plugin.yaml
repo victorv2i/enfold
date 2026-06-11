@@ -1,5 +1,10 @@
 name: holographic_plus
-version: 0.2.0
-description: "Holographic+ memory — local holographic SQLite fact store with FastEmbed dense retrieval."
-hooks:
+version: 0.3.0
+description: "Holographic+ memory: local holographic SQLite fact store with FastEmbed dense retrieval, a persistent LLM fact-extraction queue, and debounced bank rebuilds."
+# Informational only. The memory-provider loader (plugins/memory/__init__.py)
+# reads just the description above; provider hooks are invoked through the
+# MemoryProvider ABC by MemoryManager, not from this manifest.
+provides_hooks:
   - on_session_end
+  - on_pre_compress
+  - on_memory_write

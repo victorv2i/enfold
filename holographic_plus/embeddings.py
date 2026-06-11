@@ -1,9 +1,8 @@
-"""Embedding clients and cosine similarity helpers for holographic_plus.
+"""Embedding clients and serialization helpers for holographic_plus.
 
 Provides:
   - OllamaEmbedder: thin HTTP client for the /api/embed endpoint
   - FastEmbedder: local ONNX/FastEmbed client for CPU-optimized canaries
-  - cosine_similarity: numpy-based cosine similarity between float32 vectors
   - embedding_to_bytes / bytes_to_embedding: serialization helpers for SQLite BLOB storage
 """
 
@@ -28,7 +27,7 @@ _EMBED_DIM = 4096
 class OllamaEmbedder:
     """Thin synchronous HTTP client for Ollama /api/embed.
 
-    Handles connection errors gracefully — returns None on failure so callers
+    Handles connection errors gracefully: returns None on failure so callers
     can fall back to holographic-only scoring.
     """
 
@@ -72,7 +71,7 @@ class OllamaEmbedder:
             return None
 
         vec = np.array(embeddings[0], dtype=np.float32)
-        # Normalise in place so cosine_similarity is just a dot product
+        # Normalise in place so cosine similarity is just a dot product
         norm = np.linalg.norm(vec)
         if norm > 0:
             vec /= norm
@@ -120,7 +119,7 @@ class OllamaEmbedder:
         return [self.embed(t) for t in texts]
 
     def is_available(self) -> bool:
-        """Quick liveness check — returns True if Ollama is reachable."""
+        """Quick liveness check: returns True if Ollama is reachable."""
         try:
             req = urllib.request.Request(
                 f"{self.base_url}/api/tags", method="GET"
@@ -232,20 +231,3 @@ def embedding_to_bytes(vec: np.ndarray) -> bytes:
 def bytes_to_embedding(blob: bytes) -> np.ndarray:
     """Deserialize a little-endian float32 BLOB from SQLite into a numpy vector."""
     return np.frombuffer(blob, dtype="<f4").astype(np.float32, copy=True)
-
-
-# ---------------------------------------------------------------------------
-# Similarity
-# ---------------------------------------------------------------------------
-
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity between two *pre-normalised* float32 vectors.
-
-    If vectors were normalised at embed time this is just a dot product.
-    Falls back to full cosine formula for safety.
-    """
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a < 1e-9 or norm_b < 1e-9:
-        return 0.0
-    return float(np.dot(a, b) / (norm_a * norm_b))

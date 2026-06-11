@@ -1,22 +1,21 @@
-"""LLM-based fact extraction at session end.
+"""LLM-based fact extraction from conversation transcripts.
 
-Uses a configurable LLM — the host agent's own model by default — to extract
-3-7 atomic, durable facts from a conversation. Called from
-HolographicPlusProvider.on_session_end().
+Uses a configurable LLM, the host agent's own model by default, to extract
+3-7 atomic, durable facts from a conversation. Transcripts are formatted by
+the provider hooks (_format_conversation), enqueued on the persistent
+extract_queue, and processed by the provider's background worker, which calls
+extract_facts_from_transcript() and insert_facts().
 
 Design principles:
 - Only extract facts that will still be true next week
 - One fact = one atomic, self-contained statement
 - Deduplicate against existing facts in the store before inserting
-- Fail silently so a broken extraction never crashes a session
-- Run in a background thread so session teardown is non-blocking
+- The LLM call raises on failure so the queue worker can retry with backoff
 """
 from __future__ import annotations
 
 import json
 import logging
-import re
-import threading
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
@@ -31,9 +30,9 @@ You are a memory extraction assistant for an AI agent called Hermes.
 Your job: read a conversation and extract atomic facts worth remembering long-term.
 
 RULES:
-1. Extract 3-7 facts. Quality beats quantity — extract 0 if nothing is truly durable.
+1. Extract 3-7 facts. Quality beats quantity: extract 0 if nothing is truly durable.
 2. Each fact must be ONE atomic statement (1-3 sentences max, under 400 characters).
-3. ONLY extract facts that will still be true next week — no ephemeral task details.
+3. ONLY extract facts that will still be true next week, no ephemeral task details.
 4. No meta-commentary ("the user asked…"). State the fact directly.
 5. Assign a category from: user_pref | project | tool | general
 6. Assign 2-5 comma-separated tags (lowercase, no spaces).
@@ -80,7 +79,7 @@ def _format_conversation(messages: List[Dict[str, Any]], max_chars: int = 12000)
         role = msg.get("role", "unknown")
         content = msg.get("content", "")
         if not isinstance(content, str):
-            # Handle list content (tool results etc.) — flatten to string
+            # Handle list content (tool results etc.), flatten to string
             if isinstance(content, list):
                 content = " ".join(
                     part.get("text", "") if isinstance(part, dict) else str(part)
@@ -103,11 +102,34 @@ def _format_conversation(messages: List[Dict[str, Any]], max_chars: int = 12000)
 
 
 def _existing_summary(store: "MemoryStore", limit: int = 40) -> str:
-    """Return a compact summary of existing facts for the dedup prompt."""
+    """Return a compact summary of existing facts for the dedup prompt.
+
+    Blends the most trusted facts with the most recently created ones. Top
+    trust alone misses freshly inserted trust-0.5 facts, so repeated
+    pre-compress events in one session would re-extract paraphrases of facts
+    the store already holds. The recent slice keeps just-added facts in the
+    dedup context.
+    """
+    recent_slice = 15
+    top_slice = max(limit - recent_slice, 1)
     try:
         rows = store._conn.execute(
-            "SELECT content FROM facts ORDER BY trust_score DESC, updated_at DESC LIMIT ?",
-            (limit,),
+            """
+            SELECT content FROM (
+                SELECT fact_id, content FROM (
+                    SELECT fact_id, content FROM facts
+                    ORDER BY trust_score DESC, updated_at DESC LIMIT ?
+                )
+                UNION
+                SELECT fact_id, content FROM (
+                    SELECT fact_id, content FROM facts
+                    ORDER BY created_at DESC, fact_id DESC LIMIT ?
+                )
+                ORDER BY fact_id
+                LIMIT ?
+            )
+            """,
+            (top_slice, recent_slice, limit),
         ).fetchall()
         if not rows:
             return "(none)"
@@ -189,58 +211,59 @@ def _parse_response(raw: str) -> List[Dict[str, str]]:
     return validated
 
 
-def _run_extraction(
-    messages: List[Dict[str, Any]],
+def extract_facts_from_transcript(
+    transcript: str,
     store: "MemoryStore",
-    embed_callback=None,  # optional: callable(fact_id, content) to trigger embedding
     *,
-    provider: str | None = None,
-    model: str | None = None,
+    provider: str,
+    model: str,
     effort: str | None = None,
-) -> None:
-    """Core extraction logic. Runs synchronously (called from a daemon thread)."""
-    if not provider or not model:
-        logger.debug("llm_extract: no extraction provider/model configured — skipping")
-        return
-    try:
-        from agent.auxiliary_client import call_llm
-    except ImportError:
-        logger.warning("llm_extract: cannot import call_llm — skipping")
-        return
+) -> List[Dict[str, str]]:
+    """Call the extraction LLM on an already formatted transcript.
 
-    conversation = _format_conversation(messages)
-    if not conversation.strip():
-        logger.debug("llm_extract: empty conversation, skipping")
-        return
+    Returns the validated fact dicts ([] when the model finds nothing worth
+    saving). Raises on transport or LLM failure so the persistent queue
+    worker can retry with backoff instead of losing the transcript.
+    """
+    if not provider or not model:
+        raise RuntimeError("extraction provider/model not configured")
+    if not transcript or not transcript.strip():
+        return []
+
+    from agent.auxiliary_client import call_llm  # ImportError propagates: retryable
 
     existing = _existing_summary(store)
     user_msg = _USER_TEMPLATE.format(
         existing_summary=existing,
-        conversation=conversation,
+        conversation=transcript,
     )
 
-    try:
-        resp = call_llm(
-            provider=provider,
-            model=model,
-            messages=[
-                {"role": "system", "content": _SYSTEM},
-                {"role": "user",   "content": user_msg},
-            ],
-            max_tokens=1024,
-            timeout=60,
-            extra_body=({"reasoning": {"effort": effort}} if effort else None),
-        )
-        raw = resp.choices[0].message.content or ""
-    except Exception as exc:
-        logger.warning("llm_extract: LLM call failed: %s", exc)
-        return
+    resp = call_llm(
+        provider=provider,
+        model=model,
+        messages=[
+            {"role": "system", "content": _SYSTEM},
+            {"role": "user",   "content": user_msg},
+        ],
+        max_tokens=1024,
+        timeout=180,
+        extra_body=({"reasoning": {"effort": effort}} if effort else None),
+    )
+    raw = resp.choices[0].message.content or ""
+    return _parse_response(raw)
 
-    facts = _parse_response(raw)
-    if not facts:
-        logger.debug("llm_extract: no facts extracted")
-        return
 
+def insert_facts(
+    store: "MemoryStore",
+    facts: List[Dict[str, str]],
+    embed_callback=None,  # optional: callable(fact_id, content) to trigger embedding
+) -> int:
+    """Insert extracted facts into the store; returns the number stored.
+
+    Per-fact failures are logged and skipped so one bad fact never drops the
+    rest of the batch. Duplicates resolve to their existing fact_id via the
+    store's content UNIQUE constraint.
+    """
     inserted = 0
     for fact in facts:
         try:
@@ -259,48 +282,5 @@ def _run_extraction(
             logger.debug("llm_extract: add_fact failed: %s", exc)
 
     if inserted:
-        logger.info("llm_extract: inserted %d/%d new facts from session", inserted, len(facts))
-    else:
-        logger.debug("llm_extract: all %d extracted facts were duplicates", len(facts))
-
-
-def extract_facts_from_session(
-    messages: List[Dict[str, Any]],
-    store: "MemoryStore",
-    embed_callback=None,
-    blocking: bool = False,
-    *,
-    provider: str | None = None,
-    model: str | None = None,
-    effort: str | None = None,
-) -> None:
-    """Public entry point. Runs extraction in a daemon thread by default.
-
-    Args:
-        messages:       Full conversation history from on_session_end.
-        store:          The active MemoryStore instance.
-        embed_callback: Optional callable(fact_id, content) — called after each
-                        successful insert to trigger embedding in holographic_plus.
-        blocking:       If True, run synchronously (for testing). Default: False.
-        provider/model: LLM to extract with. The provider resolves these from
-                        config (``extraction_provider`` / ``extraction_model``),
-                        defaulting to the host agent's own model. Extraction is
-                        skipped if neither is set.
-        effort:         Optional reasoning-effort hint, passed via extra_body only
-                        when set so non-reasoning providers are unaffected.
-    """
-    if not provider or not model:
-        logger.debug("llm_extract: extraction provider/model not configured — skipping")
-        return
-    if blocking:
-        _run_extraction(messages, store, embed_callback, provider=provider, model=model, effort=effort)
-        return
-
-    t = threading.Thread(
-        target=_run_extraction,
-        args=(messages, store, embed_callback),
-        kwargs={"provider": provider, "model": model, "effort": effort},
-        daemon=True,
-        name="llm_fact_extract",
-    )
-    t.start()
+        logger.info("llm_extract: inserted %d/%d extracted facts", inserted, len(facts))
+    return inserted
