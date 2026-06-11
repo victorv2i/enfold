@@ -12,7 +12,7 @@ and reports recall@k for three retrievers:
 
 This isolates the embedding layer's contribution. In the full plugin these
 scores also combine with HRR and FTS5 + trust. It is a synthetic, illustrative
-benchmark — not a production guarantee. Self-contained; needs only fastembed.
+benchmark, not a production guarantee. Self-contained; needs only fastembed.
 
     python tests/eval.py
 """
@@ -22,24 +22,17 @@ import os
 import re
 import sqlite3
 import sys
-import types
 
 import numpy as np
 
-# Make the package importable without a full Hermes install (same stub as tests/conftest.py).
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if "plugins.memory.holographic" not in sys.modules:
-    for _n in ("plugins", "plugins.memory", "plugins.memory.holographic"):
-        _m = types.ModuleType(_n)
-        if _n != "plugins.memory.holographic":
-            _m.__path__ = []
-        sys.modules[_n] = _m
+# Make the package importable without a full Hermes install: reuse the test
+# suite's hermes stubs (same mechanism as tests/conftest.py).
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_TESTS_DIR))
+sys.path.insert(0, _TESTS_DIR)
+import fake_hermes  # noqa: E402
 
-    class _Base:  # minimal stub of the subclassed base
-        def __init__(self, config=None):
-            self._config = config or {}
-
-    sys.modules["plugins.memory.holographic"].HolographicMemoryProvider = _Base
+fake_hermes.install_stubs()
 
 from holographic_plus.embed_store import EmbedStore  # noqa: E402
 from holographic_plus.embeddings import FastEmbedder  # noqa: E402
@@ -71,7 +64,7 @@ CORPUS = [
     "Logs are retained for ninety days, then archived to cold storage.",
 ]
 
-# (query, target_index) — paraphrases, most with deliberately low keyword overlap.
+# (query, target_index): paraphrases, most with deliberately low keyword overlap.
 QUERIES = [
     ("Is there a way to switch the IDE to a low-light theme?", 0),
     ("When does new code reach end users?", 1),
@@ -135,7 +128,7 @@ def _mrr(ranked_per_query: list, targets: list) -> float:
 def main() -> int:
     embedder = FastEmbedder()
     if not embedder.is_available():
-        print("fastembed not installed — run `pip install fastembed` to evaluate.")
+        print("fastembed not installed, run `pip install fastembed` to evaluate.")
         return 1
 
     conn = sqlite3.connect(":memory:")
@@ -162,7 +155,7 @@ def main() -> int:
         hybrid = {i: 0.4 * kw_n[i] + 0.6 * emb_n.get(i, 0.0) for i in range(len(CORPUS))}
         hyb_ranked.append(_ranked(hybrid))
 
-    print(f"holographic_plus recall benchmark — {len(CORPUS)} facts, {len(QUERIES)} paraphrased queries\n")
+    print(f"holographic_plus recall benchmark: {len(CORPUS)} facts, {len(QUERIES)} paraphrased queries\n")
     header = f"{'retriever':<12} {'recall@1':>9} {'recall@3':>9} {'recall@5':>9} {'MRR':>7}"
     print(header)
     print("-" * len(header))

@@ -1,18 +1,20 @@
 """Regression tests for the correctness fixes:
 
 - robust JSON parsing (fences + leading/trailing prose, the load-bearing bug)
-- the hybrid blend math (`_blend_score`) — previously untested
-- the LLM extraction pipeline — previously untested
+- the hybrid blend math (`_blend_score`)
+- the transcript extraction entry points used by the persistent queue
 - blank-input batch embedding equivalence
 """
-import sys
 import types
+
+import pytest
 
 from holographic_plus import _blend_score
 from holographic_plus.llm_extract import (
     _extract_json_array,
     _parse_response,
-    extract_facts_from_session,
+    extract_facts_from_transcript,
+    insert_facts,
 )
 from holographic_plus.embeddings import OllamaEmbedder
 
@@ -69,9 +71,11 @@ def test_blend_monotonic_in_similarity():
     assert a < b < c
 
 
-# --- extraction pipeline ---------------------------------------------------
+# --- transcript extraction entry points ------------------------------------
 
 class _FakeStore:
+    """Just enough store surface for _existing_summary and insert_facts."""
+
     def __init__(self):
         self.added = []
         self._conn = self
@@ -87,42 +91,72 @@ class _FakeStore:
         return len(self.added)
 
 
-def _install_fake_call_llm(content):
-    resp = types.SimpleNamespace(
+def _llm_response(content):
+    return types.SimpleNamespace(
         choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=content))]
     )
-    sys.modules["agent"] = types.ModuleType("agent")
-    sub = types.ModuleType("agent.auxiliary_client")
-    sub.call_llm = lambda **kw: resp
-    sys.modules["agent.auxiliary_client"] = sub
 
 
-def test_extraction_pipeline_inserts_parsed_facts():
-    _install_fake_call_llm(
+def test_transcript_extraction_returns_parsed_facts(aux_module):
+    aux_module.call_llm = lambda **kw: _llm_response(
         '[{"content":"The user prefers Postgres over MySQL.","category":"user_pref","tags":"db"}]'
     )
-    store = _FakeStore()
-    extract_facts_from_session(
-        [{"role": "user", "content": "I like Postgres a lot for new projects, fyi."}],
-        store,
-        blocking=True,
+    facts = extract_facts_from_transcript(
+        "USER: I like Postgres a lot for new projects, fyi.",
+        _FakeStore(),
         provider="p",
         model="m",
     )
-    assert len(store.added) == 1 and store.added[0][1] == "user_pref"
+    assert len(facts) == 1 and facts[0]["category"] == "user_pref"
 
 
-def test_extraction_skips_when_no_provider():
-    _install_fake_call_llm('[{"content":"this fact should never be inserted","category":"general","tags":""}]')
+def test_transcript_extraction_raises_without_provider():
+    # The queue worker relies on this raising so misconfiguration is visible,
+    # not silently swallowed.
+    with pytest.raises(RuntimeError):
+        extract_facts_from_transcript(
+            "USER: some content here that is long enough to format",
+            _FakeStore(),
+            provider=None,
+            model=None,
+        )
+
+
+def test_transcript_extraction_raises_on_llm_failure(aux_module):
+    # Transport failures must propagate so the queue can retry with backoff.
+    def failing(**kw):
+        raise RuntimeError("backend down")
+
+    aux_module.call_llm = failing
+    with pytest.raises(RuntimeError):
+        extract_facts_from_transcript(
+            "USER: a transcript the backend never sees",
+            _FakeStore(),
+            provider="p",
+            model="m",
+        )
+
+
+def test_insert_facts_skips_bad_rows_keeps_rest():
     store = _FakeStore()
-    extract_facts_from_session(
-        [{"role": "user", "content": "some content here that is long enough to format"}],
+    original_add = store.add_fact
+
+    def flaky_add(content, category="general", tags=""):
+        if "bad" in content:
+            raise ValueError("boom")
+        return original_add(content, category=category, tags=tags)
+
+    store.add_fact = flaky_add
+    inserted = insert_facts(
         store,
-        blocking=True,
-        provider=None,
-        model=None,
+        [
+            {"content": "a good durable fact", "category": "general", "tags": ""},
+            {"content": "a bad fact that fails", "category": "general", "tags": ""},
+            {"content": "another good fact", "category": "tool", "tags": "x"},
+        ],
     )
-    assert store.added == []
+    assert inserted == 2
+    assert len(store.added) == 2
 
 
 # --- blank-input batch embedding ------------------------------------------

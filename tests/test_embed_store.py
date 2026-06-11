@@ -1,7 +1,6 @@
 import sqlite3
 
 import numpy as np
-import pytest
 
 from holographic_plus.embed_store import EmbedStore
 
@@ -15,16 +14,21 @@ def _store():
     return EmbedStore(conn, embedding_identity=_DOC)
 
 
-def test_upsert_get_roundtrip_and_count():
+def _count(es):
+    return int(es._conn.execute("SELECT COUNT(*) FROM fact_embeddings").fetchone()[0])
+
+
+def test_upsert_roundtrip_and_idempotence():
     es = _store()
     v = np.array([0.6, 0.8], dtype=np.float32)
     es.upsert(1, v)
-    got = es.get(1)
-    assert got is not None and np.allclose(got, v)
-    assert es.count() == 1
+    results = es.score_all(v, embedding_identity=_QUERY)
+    assert results and results[0][0] == 1
+    assert results[0][1] > 0.99  # the stored vector matches itself
+    assert _count(es) == 1
     # upsert is idempotent on (fact_id, identity)
     es.upsert(1, v)
-    assert es.count() == 1
+    assert _count(es) == 1
 
 
 def test_score_all_ranks_most_similar_first():
@@ -49,7 +53,7 @@ def test_delete_removes_and_invalidates_cache():
     # prime the cache
     es.score_all(np.array([1.0, 0.0], dtype=np.float32), embedding_identity=_QUERY)
     es.delete(1)
-    assert es.count() == 0
+    assert _count(es) == 0
     assert es.score_all(np.array([1.0, 0.0], dtype=np.float32), embedding_identity=_QUERY) == []
 
 
