@@ -52,7 +52,7 @@ from typing import Any, Dict, List, Optional
 from plugins.memory.holographic import HolographicMemoryProvider
 from .embeddings import FastEmbedder, OllamaEmbedder
 from .embed_store import EmbedStore
-from .extract_queue import ExtractQueue
+from .extract_queue import ExtractQueue, is_quota_error, quota_retry_delay
 from .llm_extract import _format_conversation, extract_facts_from_transcript, insert_facts
 from .retrieval_plus import PlusFactRetriever
 
@@ -253,6 +253,16 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             conn=self._store._conn,
             lock=getattr(self._store, "_lock", None),
         )
+        try:
+            revived = self._extract_queue.revive_recent_quota_dead()
+            if revived:
+                logger.info(
+                    "holographic_plus: auto-revived %d quota-dead extraction(s) "
+                    "younger than the 48h age cap",
+                    revived,
+                )
+        except Exception as exc:
+            logger.debug("holographic_plus: quota-dead revival failed: %s", exc)
         try:
             pending = self._extract_queue.pending_count()
             if pending:
@@ -489,6 +499,44 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                         row["id"], inserted,
                     )
             except Exception as exc:
+                err = str(exc)
+                if is_quota_error(err):
+                    # Plan-limit windows reset on the provider's schedule, not
+                    # ours: reschedule via not_before without consuming an
+                    # attempt, so the row survives until the window reopens
+                    # (bounded by the queue's 48h age cap). next_pending()
+                    # skips the row until due, so no busy-spin: the worker
+                    # falls back to its normal poll wait.
+                    delay = quota_retry_delay(err)
+                    try:
+                        rescheduled = queue.mark_quota_failed(
+                            row["id"], err, time.time() + delay
+                        )
+                    except Exception as mark_exc:
+                        # Same safety bound as below: a row whose failure
+                        # cannot be recorded must not re-run the LLM forever.
+                        self._queue_mem_attempts[row["id"]] = (
+                            self._queue_mem_attempts.get(row["id"], 0) + 1
+                        )
+                        logger.debug(
+                            "holographic_plus: could not record queue quota "
+                            "failure: %s",
+                            mark_exc,
+                        )
+                        break
+                    if rescheduled:
+                        logger.warning(
+                            "holographic_plus: queue item %d hit a provider "
+                            "quota limit, next attempt in ~%ds: %s",
+                            row["id"], int(delay), exc,
+                        )
+                    else:
+                        logger.warning(
+                            "holographic_plus: queue item %d marked dead by "
+                            "the 48h age cap",
+                            row["id"],
+                        )
+                    continue
                 mem_attempts = self._queue_mem_attempts.get(row["id"], 0) + 1
                 self._queue_mem_attempts[row["id"]] = mem_attempts
                 if mem_attempts >= self._queue_max_attempts:
