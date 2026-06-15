@@ -58,7 +58,7 @@ plugins:
     # extraction_effort: high               # only if your provider supports reasoning effort
 ```
 
-Embeddings are **identity-versioned** (`backend:model:role:vN`), so switching models never corrupts existing vectors: stale ones are simply re-embedded on the next backfill. On startup, any fact missing an embedding is backfilled in a non-blocking background thread (in batches), and the background worker re-runs the backfill periodically so transient embedding failures heal on their own.
+Embeddings are **identity-versioned** (`backend:model:role:vN`), so switching models never corrupts existing vectors: each model's vectors live under their own identity, and the new model's are backfilled in the background. On startup, any fact missing a current-identity embedding is backfilled in a non-blocking background thread (in batches), and the worker re-runs the backfill periodically so transient embedding failures heal on their own. Vectors from a superseded model are kept until you reclaim them: call `provider.vacuum_embeddings()` to drop them without re-embedding, or `rebuild_embeddings()`, which prunes them after re-embedding.
 
 ## Tools
 
@@ -112,6 +112,11 @@ The dense-embedding retrieval, LLM fact extraction, and hybrid scoring are this 
 MIT, see [LICENSE](LICENSE).
 
 ## Release notes
+
+### 0.4.0
+
+- Reclaim vectors left behind by superseded embedding models. `provider.vacuum_embeddings()` drops every vector whose identity is not the current model's (optionally keeping a canary model), without re-embedding; facts left bare are healed by the background backfill. `rebuild_embeddings()` now prunes superseded vectors after re-embedding by default (`prune_stale=False` keeps them). `EmbedStore` gains `identity_counts()` and `prune_identities(keep)`.
+- Fixes unbounded growth of the `fact_embeddings` table across model swaps: each swap previously left the old model's vectors behind indefinitely.
 
 ### 0.3.0
 

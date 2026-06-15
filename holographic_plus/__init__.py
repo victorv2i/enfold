@@ -907,10 +907,17 @@ class HolographicPlusProvider(HolographicMemoryProvider):
     # Maintenance: rebuild_embeddings
     # ------------------------------------------------------------------
 
-    def rebuild_embeddings(self, batch_size: int = 20) -> Dict[str, Any]:
+    def rebuild_embeddings(self, batch_size: int = 20, prune_stale: bool = True) -> Dict[str, Any]:
         """Recompute embeddings for all facts. Similar to rebuild_all_vectors().
 
-        Returns stats dict with: total, embedded, skipped, elapsed_sec.
+        When *prune_stale* is true (the default), vectors left behind by a
+        superseded embedding model are dropped after the rebuild: every
+        embeddable fact has just been re-embedded under the current identity,
+        so any other identity is redundant. Pass ``prune_stale=False`` to keep
+        them (for example while canarying a second model).
+
+        Returns stats dict with: total, embedded, skipped, elapsed_sec,
+        pruned_stale.
         """
         if not self._embedder_available or not self._embedder or not self._embed_store:
             return {"error": "embedding backend not available", "total": 0, "embedded": 0}
@@ -953,15 +960,62 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                     skipped += 1
 
         elapsed = round(time.perf_counter() - t0, 2)
+
+        pruned_stale = 0
+        if prune_stale and embedded > 0:
+            # Every embeddable fact now has a current-identity vector, so any
+            # vector under a different (superseded) identity is redundant.
+            try:
+                pruned_stale = self._embed_store.prune_identities(
+                    {self._embedding_identity("document")}
+                )
+            except Exception as exc:
+                logger.debug("rebuild_embeddings: prune_stale failed: %s", exc)
+
         logger.info(
-            "holographic_plus: rebuild_embeddings complete, %d/%d embedded in %.1fs",
-            embedded, total, elapsed,
+            "holographic_plus: rebuild_embeddings complete, %d/%d embedded in "
+            "%.1fs (%d superseded pruned)",
+            embedded, total, elapsed, pruned_stale,
         )
         return {
             "total": total,
             "embedded": embedded,
             "skipped": skipped,
             "elapsed_sec": elapsed,
+            "pruned_stale": pruned_stale,
+        }
+
+    def vacuum_embeddings(self, extra_keep=()) -> Dict[str, Any]:
+        """Reclaim vectors left behind by superseded embedding models.
+
+        Deletes every stored vector whose identity is not the current document
+        identity, optionally preserving *extra_keep* identities (for instance a
+        canary model running side by side). Unlike ``rebuild_embeddings`` this
+        does NOT re-embed: a fact left without a current-identity vector is
+        healed by the background backfill on its next pass, so callers reclaim
+        space without paying for a full re-embed. Returns stats: ``pruned``,
+        ``kept_identities``, and the per-identity counts ``before`` and ``after``.
+        """
+        if not self._embed_store:
+            return {"error": "embedding store not initialized", "pruned": 0}
+        current = self._embedding_identity("document")
+        keep = {current, *(str(k) for k in extra_keep)}
+        before = self._embed_store.identity_counts()
+        try:
+            pruned = self._embed_store.prune_identities(keep)
+        except ValueError as exc:
+            return {"error": str(exc), "pruned": 0}
+        after = self._embed_store.identity_counts()
+        if pruned:
+            logger.info(
+                "holographic_plus: vacuum_embeddings pruned %d superseded vector(s)",
+                pruned,
+            )
+        return {
+            "pruned": pruned,
+            "kept_identities": sorted(keep),
+            "before": before,
+            "after": after,
         }
 
     # ------------------------------------------------------------------

@@ -183,6 +183,44 @@ class EmbedStore:
             self._conn.commit()
             self._invalidate_cache()
 
+    def prune_identities(self, keep) -> int:
+        """Delete every stored vector whose identity is not in *keep*.
+
+        *keep* is an iterable of embedding-identity strings to preserve (for
+        example the current document identity, optionally plus a canary model
+        running side by side). Refuses an empty *keep* (that would wipe every
+        vector) and raises ValueError instead. Returns the number of rows
+        deleted, and drops the matrix cache when anything was removed.
+        """
+        keep_list = [str(k) for k in keep]
+        if not keep_list:
+            raise ValueError("prune_identities requires a non-empty keep set")
+        with self._lock:
+            placeholders = ",".join("?" * len(keep_list))
+            cur = self._conn.execute(
+                f"DELETE FROM fact_embeddings "
+                f"WHERE embedding_identity NOT IN ({placeholders})",
+                keep_list,
+            )
+            self._conn.commit()
+            deleted = int(cur.rowcount)
+            if deleted:
+                self._invalidate_cache()
+        return deleted
+
+    def identity_counts(self) -> dict:
+        """Return ``{embedding_identity: row_count}`` across the whole table.
+
+        Useful for spotting vectors left behind by a superseded model: each
+        model swap adds a new identity, and the old one lingers until pruned.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT embedding_identity, COUNT(*) FROM fact_embeddings "
+                "GROUP BY embedding_identity"
+            ).fetchall()
+        return {row[0]: int(row[1]) for row in rows}
+
     # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------
