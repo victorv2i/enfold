@@ -189,7 +189,7 @@ class PlusFactRetriever(FactRetriever):
 
         Cheap token-overlap match (no LLM/NER): an entity counts as mentioned
         when every word of its name appears among the query tokens, so
-        "Victor Iglesias" matches a query containing both words. Returns 0.0
+        "Alex Rivera" matches a query containing both words. Returns 0.0
         when the fact has no linked entities.
         """
         if not entity_names:

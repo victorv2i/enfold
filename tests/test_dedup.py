@@ -44,7 +44,7 @@ def test_changed_number_is_kept():
 
 
 def test_distinct_facts_are_not_duplicates():
-    assert _is_near_duplicate("Victor likes Python", "GameDeck launched on gamedeck.gg", 0.9) is False
+    assert _is_near_duplicate("Alex likes Python", "Skylark launched on skylark.example.com", 0.9) is False
 
 
 def test_value_tokens_and_content_tokens():
@@ -88,6 +88,6 @@ def test_is_superseded_detects_retired_markers():
     assert _is_superseded("STALE/DISABLED as of 2026-05-25: Gemini routing")
     assert _is_superseded("Historical/superseded note about the backend")
     assert _is_superseded("  superseded 2026: leading whitespace tolerated")
-    assert not _is_superseded("Victor prefers dark mode in the editor")
+    assert not _is_superseded("Alex prefers dark mode in the editor")
     assert not _is_superseded("The project supersedes the old plan")  # word mid-sentence, not a marker
     assert not _is_superseded("")

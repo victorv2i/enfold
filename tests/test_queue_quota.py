@@ -15,9 +15,9 @@ MESSAGES = [
 ]
 
 FACTS_JSON = json.dumps([
-    {"content": "Victor uses pnpm as his package manager for node projects.",
+    {"content": "Alex uses pnpm as his package manager for node projects.",
      "category": "tool", "tags": "pnpm,node"},
-    {"content": "Victor deploys web apps to vercel.",
+    {"content": "Alex deploys web apps to vercel.",
      "category": "tool", "tags": "deploy,vercel"},
     {"content": "CourseKit is an active project.",
      "category": "project", "tags": "coursekit"},

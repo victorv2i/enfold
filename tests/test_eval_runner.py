@@ -24,8 +24,8 @@ class FakeProvider:
 def test_run_retrieval_cases_calls_provider_without_bumping_counts():
     provider = FakeProvider({
         "dark theme": [
-            {"fact_id": 2, "content": "Victor prefers dark UI", "score": 0.9},
-            {"fact_id": 1, "content": "Victor used light UI", "score": 0.5},
+            {"fact_id": 2, "content": "Alex prefers dark UI", "score": 0.9},
+            {"fact_id": 1, "content": "Alex used light UI", "score": 0.5},
         ]
     })
     cases = [EvalCase(id="pref-ui", query="dark theme", gold_fact_id=2, stale_fact_ids=[1])]

@@ -35,7 +35,7 @@ def test_load_cases_accepts_memoryarena_v2_fields(tmp_path):
             "gold_fact_id": 10,
             "case_type": "stale_suppression",
             "expected_current_fact_ids": [10, 12],
-            "entity_refs": ["Victor", "Hermes"],
+            "entity_refs": ["Alex", "Hermes"],
             "difficulty": "hard",
             "generation": "hand",
             "privacy_tier": "private",
@@ -49,7 +49,7 @@ def test_load_cases_accepts_memoryarena_v2_fields(tmp_path):
 
     assert case.case_type == "stale_suppression"
     assert case.expected_current_fact_ids == [10, 12]
-    assert case.entity_refs == ["Victor", "Hermes"]
+    assert case.entity_refs == ["Alex", "Hermes"]
     assert case.difficulty == "hard"
     assert case.generation == "hand"
     assert case.privacy_tier == "private"

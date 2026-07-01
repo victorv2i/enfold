@@ -40,15 +40,15 @@ def test_entity_boost_off_by_default_matches_explicit_zero_weight(hp, store):
     call site's shape whenever entity_boost_weight/entity_expansion are left
     at their config defaults) must rank identically to passing them
     explicitly at 0.0/False, i.e. the defaults really are inert."""
-    store.add_fact("Victor Iglesias prefers pnpm for node projects", category="tool")
+    store.add_fact("Alex Rivera prefers pnpm for node projects", category="tool")
     store.add_fact("The deploy target for web projects is vercel", category="tool")
-    store.add_fact("Victor Iglesias keeps projects under the home directory", category="project")
+    store.add_fact("Alex Rivera keeps projects under the home directory", category="project")
 
     defaulted = _retriever(hp, store)
     explicit_off = _retriever(hp, store, entity_boost_weight=0.0, entity_expansion=False)
 
-    expected = explicit_off.search("Victor Iglesias projects", min_trust=0.0, limit=10)
-    actual = defaulted.search("Victor Iglesias projects", min_trust=0.0, limit=10)
+    expected = explicit_off.search("Alex Rivera projects", min_trust=0.0, limit=10)
+    actual = defaulted.search("Alex Rivera projects", min_trust=0.0, limit=10)
 
     assert [f["fact_id"] for f in actual] == [f["fact_id"] for f in expected]
     for a, e in zip(actual, expected):
@@ -60,14 +60,14 @@ def test_entity_boost_off_by_default_matches_parent_lexical_recall(hp, store):
     lexical-recall difference from the base parent (OR vs AND FTS semantics,
     see retrieval_plus.py) is unchanged: no entity-only rows sneak into the
     result set beyond what that superset recall already produces."""
-    store.add_fact("Victor Iglesias prefers pnpm for node projects", category="tool")
+    store.add_fact("Alex Rivera prefers pnpm for node projects", category="tool")
     store.add_fact("The deploy target for web projects is vercel", category="tool")
     third_id = store.add_fact(
-        "Victor Iglesias keeps projects under the home directory", category="project"
+        "Alex Rivera keeps projects under the home directory", category="project"
     )
 
     plus = _retriever(hp, store)
-    actual = plus.search("Victor Iglesias projects", min_trust=0.0, limit=10)
+    actual = plus.search("Alex Rivera projects", min_trust=0.0, limit=10)
 
     # third_id matches "projects" lexically (OR semantics), so it is present,
     # but strictly ranked below the two-token match and carries no
@@ -82,16 +82,16 @@ def test_entity_boost_off_by_default_matches_parent_lexical_recall(hp, store):
 
 def test_query_entity_mention_boosts_linked_facts(hp, store):
     # Two facts equally relevant lexically to "projects", but only one is
-    # linked to the "Victor Iglesias" entity mentioned in the query.
+    # linked to the "Alex Rivera" entity mentioned in the query.
     linked_id = store.add_fact(
-        "Victor Iglesias runs several side projects", category="project"
+        "Alex Rivera runs several side projects", category="project"
     )
     unlinked_id = store.add_fact(
         "The team runs several side projects", category="project"
     )
 
     plus = _retriever(hp, store, entity_boost_weight=0.5)
-    results = plus.search("Victor Iglesias side projects", min_trust=0.0, limit=10)
+    results = plus.search("Alex Rivera side projects", min_trust=0.0, limit=10)
 
     by_id = {f["fact_id"]: f for f in results}
     assert by_id[linked_id]["score"] > by_id[unlinked_id]["score"]
@@ -99,18 +99,18 @@ def test_query_entity_mention_boosts_linked_facts(hp, store):
 
 def test_entity_boost_weight_zero_gives_no_boost_even_with_entity_mention(hp, store):
     linked_id = store.add_fact(
-        "Victor Iglesias runs several side projects", category="project"
+        "Alex Rivera runs several side projects", category="project"
     )
 
     plus_off = _retriever(hp, store, entity_boost_weight=0.0)
     plus_on = _retriever(hp, store, entity_boost_weight=0.5)
 
     score_off = next(
-        f["score"] for f in plus_off.search("Victor Iglesias side projects", min_trust=0.0, limit=10)
+        f["score"] for f in plus_off.search("Alex Rivera side projects", min_trust=0.0, limit=10)
         if f["fact_id"] == linked_id
     )
     score_on = next(
-        f["score"] for f in plus_on.search("Victor Iglesias side projects", min_trust=0.0, limit=10)
+        f["score"] for f in plus_on.search("Alex Rivera side projects", min_trust=0.0, limit=10)
         if f["fact_id"] == linked_id
     )
     assert score_on > score_off
@@ -123,12 +123,12 @@ def test_entity_boost_weight_zero_gives_no_boost_even_with_entity_mention(hp, st
 
 def test_one_hop_expansion_surfaces_related_fact_below_direct_hits(hp, store):
     direct_id = store.add_fact(
-        "Victor Iglesias prefers pnpm for node projects", category="tool"
+        "Alex Rivera prefers pnpm for node projects", category="tool"
     )
-    # Shares the "Victor Iglesias" entity but has no lexical overlap with the
+    # Shares the "Alex Rivera" entity but has no lexical overlap with the
     # query at all, so plain FTS/Jaccard/HRR would never surface it.
     related_id = store.add_fact(
-        "Victor Iglesias lives in Miami", category="general"
+        "Alex Rivera lives in Springfield", category="general"
     )
     # No entity relationship at all: must not be pulled in by expansion.
     unrelated_id = store.add_fact(
@@ -156,8 +156,8 @@ def test_one_hop_expansion_surfaces_related_fact_below_direct_hits(hp, store):
 
 
 def test_expansion_is_off_by_default_even_with_boost_weight_set(hp, store):
-    store.add_fact("Victor Iglesias prefers pnpm for node projects", category="tool")
-    related_id = store.add_fact("Victor Iglesias lives in Miami", category="general")
+    store.add_fact("Alex Rivera prefers pnpm for node projects", category="tool")
+    related_id = store.add_fact("Alex Rivera lives in Springfield", category="general")
 
     plus = _retriever(hp, store, entity_boost_weight=0.3)  # entity_expansion not set
     results = plus.search("pnpm preference for node", min_trust=0.0, limit=10)
@@ -171,12 +171,12 @@ def test_expansion_is_off_by_default_even_with_boost_weight_set(hp, store):
 
 def test_hub_entity_is_excluded_from_expansion(hp, store):
     direct_id = store.add_fact(
-        "Victor Iglesias prefers pnpm for node projects", category="tool"
+        "Alex Rivera prefers pnpm for node projects", category="tool"
     )
-    # "Victor Iglesias" becomes a hub: linked to > entity_hub_degree_limit facts.
+    # "Alex Rivera" becomes a hub: linked to > entity_hub_degree_limit facts.
     hub_limit = 5
     for i in range(hub_limit + 5):
-        store.add_fact(f"Victor Iglesias noted item number {i} today", category="general")
+        store.add_fact(f"Alex Rivera noted item number {i} today", category="general")
 
     plus = _retriever(
         hp, store, entity_boost_weight=0.3, entity_expansion=True,
@@ -186,22 +186,22 @@ def test_hub_entity_is_excluded_from_expansion(hp, store):
 
     ids = [f["fact_id"] for f in results]
     # None of the "noted item" filler facts should be pulled in purely via the
-    # now-hub "Victor Iglesias" entity.
+    # now-hub "Alex Rivera" entity.
     assert not any("noted item number" in f["content"] for f in results if f["fact_id"] != direct_id)
     assert direct_id in ids
 
 
 def test_non_hub_entity_still_expands_when_hub_limit_set_low(hp, store):
     direct_id = store.add_fact(
-        "Victor Iglesias prefers pnpm for node projects", category="tool"
+        "Alex Rivera prefers pnpm for node projects", category="tool"
     )
-    related_id = store.add_fact("Victor Iglesias lives in Miami", category="general")
+    related_id = store.add_fact("Alex Rivera lives in Springfield", category="general")
 
     plus = _retriever(
         hp, store, entity_boost_weight=0.3, entity_expansion=True,
         entity_hub_degree_limit=25,
     )
-    results = plus.search("Victor Iglesias pnpm preference", min_trust=0.0, limit=10)
+    results = plus.search("Alex Rivera pnpm preference", min_trust=0.0, limit=10)
 
     ids = [f["fact_id"] for f in results]
     assert direct_id in ids

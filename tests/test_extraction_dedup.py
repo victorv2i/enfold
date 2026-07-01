@@ -121,7 +121,7 @@ def test_semantic_gate_catches_paraphrase_with_low_jaccard(make_provider):
 
 def test_low_cosine_and_low_jaccard_is_not_a_duplicate(make_provider):
     a = "The user prefers Postgres over MySQL for new projects."
-    b = "GameDeck launched publicly at gamedeck.gg this month."
+    b = "Skylark launched publicly at skylark.example.com this month."
 
     provider = make_provider(dedup_cosine=0.92)
     _add_with_embedding(provider, a, "user_pref", [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -138,8 +138,8 @@ def test_low_cosine_and_low_jaccard_is_not_a_duplicate(make_provider):
 # ---------------------------------------------------------------------------
 
 def test_semantic_gate_never_drops_a_changed_value(make_provider):
-    a = "The LDI Canvas port is 3100."
-    b = "The LDI Canvas port is 3200."
+    a = "The Skylark dashboard port is 3100."
+    b = "The Skylark dashboard port is 3200."
 
     # Force near-identical embeddings (as a real embedder would give two
     # sentences differing by one digit) to prove the value-token guard, not
