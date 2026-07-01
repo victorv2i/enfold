@@ -18,6 +18,8 @@ Config (same ``plugins.hermes-memory-store`` block, extra keys):
         embed_on_add: true               # embed immediately when a fact is added (default true)
         dedup_on_add: true               # skip near-verbatim restatements on add (default true)
         dedup_jaccard: 0.9               # word-overlap needed to call it a duplicate (same values required)
+        dedup_cosine: 0.92               # dense cosine needed to call a paraphrase a duplicate (same values required)
+        extract_drain_batch: 5           # extraction queue rows processed per drain tick (default 5)
         # extraction_provider / extraction_model: default to the host agent's model
 
 Retrieval weights:
@@ -109,6 +111,25 @@ def _is_near_duplicate(content: str, other: str, threshold: float) -> bool:
     if _jaccard(_norm_tokens(content), _norm_tokens(other)) < threshold:
         return False
     return _content_tokens(content) == _content_tokens(other)
+
+
+def _is_semantic_duplicate(
+    content: str, other: str, cosine: Optional[float], threshold: float
+) -> bool:
+    """True if *content* is a paraphrase of *other*: same concrete values (the
+    value-token guard that keeps genuine updates from being dropped) AND a dense
+    cosine similarity >= *threshold*.
+
+    Catches reworded restatements that share few surface words (low Jaccard) but
+    the same meaning, e.g. "prefers Postgres over MySQL" vs "always reaches for
+    Postgres instead of MySQL". Returns False when *cosine* is None (embedder
+    unavailable), so callers fall back to the Jaccard check alone.
+    """
+    if cosine is None:
+        return False
+    if _value_tokens(content) != _value_tokens(other):
+        return False
+    return cosine >= threshold
 
 
 _SUPERSEDED_PREFIXES = ("superseded", "stale/disabled", "historical/superseded")
@@ -225,6 +246,12 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         # (heavy word overlap AND identical concrete values, so updates are kept).
         self._dedup_on_add: bool   = bool(cfg.get("dedup_on_add", True))
         self._dedup_jaccard: float = float(cfg.get("dedup_jaccard", 0.9))
+        # Semantic dedup: catches paraphrases that share few surface words (low
+        # Jaccard) but the same meaning, via the dense cosine already computed
+        # in the write path. ORed with the Jaccard check, both still gated by
+        # the value-token guard so a changed number/SHA/state word is always
+        # kept as an update.
+        self._dedup_cosine: float  = float(cfg.get("dedup_cosine", 0.92))
 
         # Optional final-stage retrieval decision gates. Disabled by default so
         # existing installs preserve current recall until a MemoryArena-calibrated
@@ -271,6 +298,10 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         self._queue_backoff_cap: float = 300.0    # seconds
         self._queue_poll_interval: float = 60.0   # seconds between idle wakeups
         self._backfill_interval: float = 900.0    # seconds between embed backfill ticks
+        # Cap on rows processed per drain tick: a large backlog (e.g. after
+        # extraction was down) drains over hours at the poll interval instead
+        # of firing the extraction LLM back-to-back for the whole backlog.
+        self._extract_drain_batch: int = int(cfg.get("extract_drain_batch", 5))
 
     # ------------------------------------------------------------------
     # Embedding backend helpers
@@ -632,14 +663,19 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                         logger.debug("holographic_plus: backfill tick failed: %s", exc)
 
     def _drain_extract_queue(self, stop: threading.Event, queue: ExtractQueue) -> None:
-        """Process pending rows until the queue is empty or stop is set."""
+        """Process up to _extract_drain_batch pending rows, or until stop is set.
+
+        A large backlog (extraction was down, or a burst of sessions ended at
+        once) drains a few items per poll tick instead of firing the
+        extraction LLM back-to-back for the whole backlog in one go.
+        """
         if not self._store:
             return
         if not self._extract_provider or not self._extract_model:
             return
 
         processed = 0
-        while not stop.is_set():
+        while not stop.is_set() and processed < self._extract_drain_batch:
             # Rows that hit the in-memory attempt cap are dropped from this
             # process's consideration until restart, even when the DB-side
             # mark_failed bookkeeping is broken and cannot record failures.
@@ -659,12 +695,16 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                     provider=self._extract_provider,
                     model=self._extract_model,
                     effort=self._extract_effort,
+                    search_fn=lambda topic, limit: self.search(
+                        topic, min_trust=self._min_trust, limit=limit, bump=False
+                    ),
                 )
                 inserted = 0
                 if facts:
                     with self._deferred_bank_rebuild():
                         inserted = insert_facts(
-                            self._store, facts, embed_callback=self._embed_cb
+                            self._store, facts, embed_callback=self._embed_cb,
+                            dedup_check=self._find_near_duplicate if self._dedup_on_add else None,
                         )
                 queue.mark_done(row["id"])
                 self._queue_mem_attempts.pop(row["id"], None)
@@ -1174,9 +1214,13 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         """Return an existing active fact that *content* merely restates, else None.
 
         Uses the hybrid search to fetch the closest existing facts, then keeps
-        only a match that overlaps heavily in wording (token Jaccard >=
-        ``self._dedup_jaccard``) AND carries the same concrete values, so an
-        updated value is never skipped. Degrades to None (normal add) on error.
+        only a match that either:
+          - overlaps heavily in wording (token Jaccard >= ``self._dedup_jaccard``), or
+          - is a semantic paraphrase (dense cosine >= ``self._dedup_cosine``,
+            using the embedding ``search()`` already computed for these
+            candidates),
+        AND carries the same concrete values in both cases, so a genuine value
+        update is never skipped. Degrades to None (normal add) on error.
         """
         if not content:
             return None
@@ -1192,7 +1236,12 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             logger.debug("holographic_plus: dedup search failed: %s", exc)
             return None
         for r in results:
-            if _is_near_duplicate(content, r.get("content", ""), self._dedup_jaccard):
+            other = r.get("content", "")
+            if _is_near_duplicate(content, other, self._dedup_jaccard):
+                return r
+            if _is_semantic_duplicate(
+                content, other, r.get("embedding_score"), self._dedup_cosine
+            ):
                 return r
         return None
 
