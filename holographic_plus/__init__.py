@@ -116,6 +116,9 @@ def _is_near_duplicate(content: str, other: str, threshold: float) -> bool:
     return _content_tokens(content) == _content_tokens(other)
 
 
+_RESTATEMENT_JACCARD = 0.7
+
+
 def _is_semantic_duplicate(
     content: str, other: str, cosine: Optional[float], threshold: float
 ) -> bool:
@@ -127,11 +130,22 @@ def _is_semantic_duplicate(
     the same meaning, e.g. "prefers Postgres over MySQL" vs "always reaches for
     Postgres instead of MySQL". Returns False when *cosine* is None (embedder
     unavailable), so callers fall back to the Jaccard check alone.
+
+    Guards against a gap the Jaccard path already closes: when *content* and
+    *other* share almost all of their wording (raw Jaccard >= the near-restatement
+    bar) but differ in a content word, that is a state-word flip (active ->
+    archived, enabled -> disabled), i.e. an UPDATE, not a duplicate, even if the
+    embedder's cosine similarity is high. A pair with mostly different wording is
+    left to the cosine check alone, so genuine low-Jaccard paraphrases are still
+    caught.
     """
     if cosine is None:
         return False
     if _value_tokens(content) != _value_tokens(other):
         return False
+    if _content_tokens(content) != _content_tokens(other):
+        if _jaccard(_norm_tokens(content), _norm_tokens(other)) >= _RESTATEMENT_JACCARD:
+            return False
     return cosine >= threshold
 
 

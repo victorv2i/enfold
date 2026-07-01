@@ -2,6 +2,7 @@
 
 from holographic_plus import (
     _is_near_duplicate,
+    _is_semantic_duplicate,
     _is_superseded,
     _value_tokens,
     _content_tokens,
@@ -57,6 +58,29 @@ def test_blend_score_dense_term_not_trust_weighted():
     assert abs(_blend_score(0.0, 1.0, 0.45) - 0.45) < 1e-9          # cosine 1.0 -> emb_norm 1.0
     assert abs(_blend_score(0.0, 0.0, 0.45) - 0.45 * 0.5) < 1e-9    # cosine 0 -> emb_norm 0.5
     assert _blend_score(0.5, None, 0.45) == (1.0 - 0.45) * 0.5      # no embedding -> base only
+
+
+def test_semantic_duplicate_antonym_flip_is_kept():
+    # Regression: with no digit tokens, _value_tokens are both empty and "equal",
+    # so a high cosine alone must not be enough to call a state-word change
+    # (active -> archived) a duplicate. This is an UPDATE and must be kept.
+    a = "The LDI Canvas sandbox service is currently active"
+    b = "The LDI Canvas sandbox service is currently archived"
+    assert _is_semantic_duplicate(a, b, 0.99, 0.92) is False
+
+
+def test_semantic_duplicate_paraphrase_is_caught():
+    a = "prefers Postgres over MySQL"
+    b = "always reaches for Postgres instead of MySQL"
+    assert _is_semantic_duplicate(a, b, 0.95, 0.92) is True
+
+
+def test_semantic_duplicate_same_content_tokens_reordered_is_caught():
+    # Same content words, just reordered with different filler/stopwords ->
+    # still a duplicate under the cosine gate, same as the Jaccard path allows.
+    a = "the LDI Canvas port is 3100 on the host"
+    b = "LDI Canvas port 3100 host"
+    assert _is_semantic_duplicate(a, b, 0.95, 0.92) is True
 
 
 def test_is_superseded_detects_retired_markers():
