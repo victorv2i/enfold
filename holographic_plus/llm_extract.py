@@ -38,6 +38,10 @@ RULES:
 6. Assign 2-5 comma-separated tags (lowercase, no spaces).
 7. Do NOT extract facts already obvious from names/dates (e.g. "today is Monday").
 8. Skip anything that's clearly a one-off instruction to the agent for this session.
+9. Emit each distinct fact EXACTLY ONCE. Never output multiple rephrasings or near-duplicates of the same fact (e.g. the same SHA, URL, port, or status stated several ways) — choose the single clearest phrasing.
+10. Resolve pronouns and vague references to concrete entities so each fact stands alone out of context.
+11. If a fact corrects or updates something in the known facts, state the new fact with the current value (the system supersedes the old one); do not restate unchanged known facts.
+12. Convert relative time references ("yesterday", "last week", "next month") to absolute dates using TODAY'S DATE (given below), so every fact is unambiguous out of context.
 
 GOOD facts:
 - "The user prefers Postgres over MySQL for new projects."
@@ -48,6 +52,7 @@ BAD facts (don't extract):
 - "The user asked me to summarize a document." (ephemeral task)
 - "The conversation was about memory systems." (meta)
 - "The user said hello." (trivial)
+- The same fact restated several ways, e.g. "X is pinned at SHA abc" + "X uses commit abc" + "X's clone is at abc" (duplication — output it once)
 
 OUTPUT: Respond with a JSON array only. No prose, no markdown fences.
 Example:
@@ -60,7 +65,7 @@ If nothing is worth saving, output: []
 """
 
 _USER_TEMPLATE = """\
-Here is the conversation to extract facts from.
+Today's date is {today}. Here is the conversation to extract facts from.
 Existing known facts (do not re-extract these):
 {existing_summary}
 
@@ -233,7 +238,9 @@ def extract_facts_from_transcript(
     from agent.auxiliary_client import call_llm  # ImportError propagates: retryable
 
     existing = _existing_summary(store)
+    from datetime import date
     user_msg = _USER_TEMPLATE.format(
+        today=date.today().isoformat(),
         existing_summary=existing,
         conversation=transcript,
     )
