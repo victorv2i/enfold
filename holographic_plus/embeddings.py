@@ -28,7 +28,8 @@ class OllamaEmbedder:
     """Thin synchronous HTTP client for Ollama /api/embed.
 
     Handles connection errors gracefully: returns None on failure so callers
-    can fall back to holographic-only scoring.
+    can fall back to holographic-only scoring. Passes ``keep_alive`` on every
+    request so the embedding model stays resident between calls.
     """
 
     backend = "ollama"
@@ -38,17 +39,25 @@ class OllamaEmbedder:
         base_url: str = _DEFAULT_OLLAMA_URL,
         model: str = _DEFAULT_MODEL,
         timeout: float = 30.0,
+        keep_alive: int | str = -1,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
+        # Sent to Ollama on every embed call so the model stays resident.
+        # -1 keeps it loaded indefinitely, avoiding a multi-second cold-load on
+        # the first memory read/write after an idle gap. A duration string like
+        # "30m" or a second count also works; 0 unloads immediately.
+        self.keep_alive = keep_alive
         self._embed_url = f"{self.base_url}/api/embed"
 
     def embed(self, text: str) -> Optional[np.ndarray]:
         """Return a float32 embedding vector for *text*, or None on error."""
         if not text or not text.strip():
             return None
-        payload = json.dumps({"model": self.model, "input": text}).encode()
+        payload = json.dumps(
+            {"model": self.model, "input": text, "keep_alive": self.keep_alive}
+        ).encode()
         req = urllib.request.Request(
             self._embed_url,
             data=payload,
@@ -91,7 +100,9 @@ class OllamaEmbedder:
         if not send_idx:
             return [None for _ in texts]
         send_texts = [texts[i] for i in send_idx]
-        payload = json.dumps({"model": self.model, "input": send_texts}).encode()
+        payload = json.dumps(
+            {"model": self.model, "input": send_texts, "keep_alive": self.keep_alive}
+        ).encode()
         req = urllib.request.Request(
             self._embed_url,
             data=payload,
