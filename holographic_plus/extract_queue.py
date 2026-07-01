@@ -134,7 +134,14 @@ class ExtractQueue:
         info = self._conn.execute("PRAGMA table_info(extract_queue)").fetchall()
         cols = {row[1] for row in info}
         if "not_before" not in cols:
-            self._conn.execute("ALTER TABLE extract_queue ADD COLUMN not_before REAL")
+            try:
+                self._conn.execute("ALTER TABLE extract_queue ADD COLUMN not_before REAL")
+            except sqlite3.OperationalError as exc:
+                # Two processes racing this same check-then-add on a fresh db
+                # (e.g. two MCP server instances starting at once): the
+                # loser's ALTER TABLE is a no-op, not a real failure.
+                if "duplicate column name" not in str(exc).lower():
+                    raise
 
     @staticmethod
     def _age_exceeded(created_epoch) -> bool:

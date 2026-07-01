@@ -45,14 +45,28 @@ def ensure_temporal_schema(conn: sqlite3.Connection) -> None:
     "currently valid" (``invalid_at IS NULL``) without a backfill pass, and a
     live database of a few thousand facts migrates in well under a second (3
     ``ALTER TABLE ... ADD COLUMN`` statements, no data rewrite).
+
+    The check-then-add is racy across two separate processes migrating the
+    same fresh db_path at the same moment (both see the column missing, both
+    ``ALTER TABLE``, the second raises "duplicate column name"): several
+    agents each starting their own MCP server against a brand-new store can
+    hit this on first run. ``ADD COLUMN`` on an already-migrated table is
+    swallowed as a lost race, not a real failure, so this stays a no-op for
+    the loser instead of crashing initialize().
     """
     cols = {row[1] for row in conn.execute("PRAGMA table_info(facts)").fetchall()}
-    if "valid_from" not in cols:
-        conn.execute("ALTER TABLE facts ADD COLUMN valid_from TIMESTAMP")
-    if "invalid_at" not in cols:
-        conn.execute("ALTER TABLE facts ADD COLUMN invalid_at TIMESTAMP")
-    if "superseded_by" not in cols:
-        conn.execute("ALTER TABLE facts ADD COLUMN superseded_by INTEGER")
+    for column, coltype in (
+        ("valid_from", "TIMESTAMP"),
+        ("invalid_at", "TIMESTAMP"),
+        ("superseded_by", "INTEGER"),
+    ):
+        if column in cols:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE facts ADD COLUMN {column} {coltype}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
     conn.commit()
 
 

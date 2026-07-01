@@ -110,7 +110,15 @@ class EmbedStore:
         info = self._conn.execute("PRAGMA table_info(fact_embeddings)").fetchall()
         cols = {row[1] for row in info}
         if "embedding_identity" not in cols:
-            self._conn.execute("ALTER TABLE fact_embeddings ADD COLUMN embedding_identity TEXT")
+            try:
+                self._conn.execute("ALTER TABLE fact_embeddings ADD COLUMN embedding_identity TEXT")
+            except sqlite3.OperationalError as exc:
+                # Two processes racing this same check-then-add on a fresh db
+                # (e.g. two MCP server instances starting against a brand new
+                # store at once): the loser's ALTER TABLE is a no-op, not a
+                # real failure.
+                if "duplicate column name" not in str(exc).lower():
+                    raise
             info = self._conn.execute("PRAGMA table_info(fact_embeddings)").fetchall()
 
         pk_cols = [row[1] for row in sorted(info, key=lambda row: row[5]) if row[5] > 0]

@@ -10,6 +10,7 @@ string-prefix filter still works alongside structural supersession.
 """
 
 import sqlite3
+import threading
 
 import pytest
 
@@ -72,6 +73,49 @@ def test_migration_is_idempotent():
     ensure_temporal_schema(conn)  # second call must not raise or duplicate columns
     cols = [row[1] for row in conn.execute("PRAGMA table_info(facts)").fetchall()]
     assert cols.count("invalid_at") == 1
+
+
+def test_migration_survives_concurrent_add_column_race(tmp_path):
+    """Two real connections racing the same check-then-ALTER on a fresh db_path.
+
+    Regression: two separate MCP server processes starting against a brand
+    new store at the same moment can both see the column missing (PRAGMA
+    table_info) before either has run its ALTER TABLE, so both attempt it;
+    the loser raised "duplicate column name" and crashed initialize(). A
+    barrier holds both threads at the same start line so the race is
+    deterministic rather than relying on scheduling luck.
+    """
+    db_path = tmp_path / "race.db"
+    setup = sqlite3.connect(str(db_path))
+    setup.executescript(_SCHEMA)
+    setup.commit()
+    setup.close()
+
+    start = threading.Barrier(2)
+    errors = []
+
+    def worker():
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        start.wait()
+        try:
+            ensure_temporal_schema(conn)
+        except Exception as exc:  # pragma: no cover - failure surfaced via assert
+            errors.append(str(exc))
+        conn.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, errors
+
+    check = sqlite3.connect(str(db_path))
+    cols = [row[1] for row in check.execute("PRAGMA table_info(facts)").fetchall()]
+    assert cols.count("invalid_at") == 1
+    assert {"valid_from", "invalid_at", "superseded_by"} <= set(cols)
+    check.close()
 
 
 def test_migration_leaves_existing_rows_currently_valid():
