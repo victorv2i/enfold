@@ -19,6 +19,7 @@ Config (same ``plugins.hermes-memory-store`` block, extra keys):
         dedup_on_add: true               # skip near-verbatim restatements on add (default true)
         dedup_jaccard: 0.9               # word-overlap needed to call it a duplicate (same values required)
         dedup_cosine: 0.92               # dense cosine needed to call a paraphrase a duplicate (same values required)
+        temporal_filter: true            # exclude structurally superseded facts from search (default true)
         extract_drain_batch: 5           # extraction queue rows processed per drain tick (default 5)
         # extraction_provider / extraction_model: default to the host agent's model
         entity_boost_weight: 0.0         # additive boost for facts linked to a query-mentioned entity (default off)
@@ -163,6 +164,7 @@ from .embed_store import EmbedStore
 from .extract_queue import ExtractQueue, is_quota_error, quota_retry_delay
 from .llm_extract import _format_conversation, extract_facts_from_transcript, insert_facts
 from .retrieval_plus import PlusFactRetriever
+from .temporal import ensure_temporal_schema, fact_history, find_value_update_target, supersede
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +271,11 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         # the value-token guard so a changed number/SHA/state word is always
         # kept as an update.
         self._dedup_cosine: float  = float(cfg.get("dedup_cosine", 0.92))
+
+        # Temporal validity: search excludes structurally superseded facts
+        # (invalid_at set) unless disabled, reproducing pre-temporal ranking
+        # exactly when turned off.
+        self._temporal_filter: bool = _cfg_bool(cfg.get("temporal_filter"), True)
 
         # Optional final-stage retrieval decision gates. Disabled by default so
         # existing installs preserve current recall until a MemoryArena-calibrated
@@ -390,6 +397,12 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         prev_store = self._store
         prev_quiescent = self._teardown_background()
         super().initialize(session_id, **kwargs)
+
+        # Additive schema migration for temporal validity: idempotent, so
+        # safe to run on every initialize() including a re-init against the
+        # same store.
+        ensure_temporal_schema(self._store._conn)
+
         if prev_store is not None and prev_store is not self._store:
             if prev_quiescent:
                 try:
@@ -725,6 +738,8 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                         inserted = insert_facts(
                             self._store, facts, embed_callback=self._embed_cb,
                             dedup_check=self._find_near_duplicate if self._dedup_on_add else None,
+                            update_check=self._find_update_target if self._dedup_on_add else None,
+                            supersede=self._supersede_fact if self._dedup_on_add else None,
                         )
                 queue.mark_done(row["id"])
                 self._queue_mem_attempts.pop(row["id"], None)
@@ -1014,6 +1029,8 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         # Exclude explicitly-superseded facts from retrieval (demote-not-delete
         # only works if reads skip them; trust demotion alone proved unreliable).
         holo_results = [r for r in holo_results if not _is_superseded(r.get("content", ""))]
+        if self._temporal_filter:
+            holo_results = self._exclude_temporally_invalid(holo_results)
 
         if not self._embedder_available or not self._embed_store or not self._embedder:
             # Pure holographic fallback
@@ -1079,7 +1096,8 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 rows = self._store._conn.execute(
                     f"""
                     SELECT fact_id, content, category, tags, trust_score,
-                           retrieval_count, helpful_count, created_at, updated_at
+                           retrieval_count, helpful_count, created_at, updated_at,
+                           invalid_at
                     FROM facts
                     WHERE fact_id IN ({placeholders})
                       AND trust_score >= ?{category_clause}
@@ -1090,6 +1108,9 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 d = dict(row)
                 if _is_superseded(d.get("content", "")):
                     continue
+                if self._temporal_filter and d.pop("invalid_at", None) is not None:
+                    continue
+                d.pop("invalid_at", None)
                 d["score"] = 0.0  # no holographic score
                 extra_facts.append(d)
 
@@ -1127,6 +1148,34 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         if bump:
             self._bump_retrieval_counts(selected)
         return selected
+
+    def _exclude_temporally_invalid(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Drop rows whose fact has been structurally superseded (invalid_at set).
+
+        ``_retriever.search()`` candidate rows don't carry ``invalid_at`` (see
+        ``PlusFactRetriever._fts_candidates``), so this looks it up in one
+        query over the candidate fact_ids rather than changing the parent's
+        candidate SQL. Degrades to returning *results* unchanged on error, so
+        a lookup failure never breaks search.
+        """
+        if not results or not self._store:
+            return results
+        ids = [int(r["fact_id"]) for r in results]
+        try:
+            placeholders = ",".join("?" * len(ids))
+            with self._store._lock:
+                rows = self._store._conn.execute(
+                    f"SELECT fact_id FROM facts "
+                    f"WHERE fact_id IN ({placeholders}) AND invalid_at IS NOT NULL",
+                    ids,
+                ).fetchall()
+        except Exception as exc:
+            logger.debug("holographic_plus: temporal filter lookup failed: %s", exc)
+            return results
+        invalid_ids = {int(r["fact_id"]) for r in rows}
+        if not invalid_ids:
+            return results
+        return [r for r in results if r["fact_id"] not in invalid_ids]
 
     def _apply_retrieval_decision(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Apply optional final-stage confidence gates to ranked search results.
@@ -1210,11 +1259,11 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             except Exception as exc:
                 return _json.dumps({"error": str(exc)})
 
+        update_target: Optional[Dict[str, Any]] = None
         if action == "add" and self._dedup_on_add:
-            dup = self._find_near_duplicate(
-                (args.get("content") or "").strip(),
-                category=args.get("category"),
-            )
+            content = (args.get("content") or "").strip()
+            category = args.get("category")
+            dup = self._find_near_duplicate(content, category=category)
             if dup is not None:
                 return _json.dumps({
                     "fact_id": dup.get("fact_id"),
@@ -1224,9 +1273,21 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                         "not stored again"
                     ),
                 })
+            update_target = self._find_update_target(content, category=category)
 
         # For all other actions delegate to parent
-        return super()._handle_fact_store(args)
+        result_json = super()._handle_fact_store(args)
+
+        if action == "add" and update_target is not None:
+            try:
+                result = _json.loads(result_json)
+            except Exception:
+                result = {}
+            new_fact_id = result.get("fact_id")
+            if new_fact_id and result.get("status") == "added":
+                self._supersede_fact(int(update_target["fact_id"]), int(new_fact_id))
+
+        return result_json
 
     def _find_near_duplicate(
         self, content: str, category: Optional[str] = None
@@ -1264,6 +1325,59 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             ):
                 return r
         return None
+
+    def _find_update_target(
+        self, content: str, category: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Return the existing active fact that *content* is a VALUE UPDATE of, else None.
+
+        Only called after ``_find_near_duplicate`` finds no restatement: a
+        value update (same content words, a changed concrete value, e.g.
+        "port is 3100" -> "port is 3200") is exactly the case the dedup gate
+        deliberately lets through as a new insert. Reuses the same candidate
+        search so this costs no extra query beyond the dedup check already run.
+        Degrades to None (plain add, no supersession) on error.
+        """
+        if not content:
+            return None
+        try:
+            results = self.search(
+                content, category=category, min_trust=self._min_trust,
+                limit=3, bump=False,
+            )
+        except Exception as exc:
+            logger.debug("holographic_plus: update-target search failed: %s", exc)
+            return None
+        return find_value_update_target(content, results)
+
+    def _supersede_fact(self, old_fact_id: int, new_fact_id: int) -> None:
+        """Structurally supersede *old_fact_id* with *new_fact_id* (invalidate-not-delete).
+
+        Never fails the caller's insert: any error here is logged and
+        swallowed, leaving both rows live rather than losing the new fact.
+        """
+        if not self._store or old_fact_id == new_fact_id:
+            return
+        try:
+            with self._store._lock:
+                supersede(self._store._conn, old_fact_id, new_fact_id)
+        except Exception as exc:
+            logger.debug(
+                "holographic_plus: supersede(%s -> %s) failed: %s",
+                old_fact_id, new_fact_id, exc,
+            )
+
+    def fact_history(self, fact_id: int) -> List[Dict[str, Any]]:
+        """Return the full supersession chain containing *fact_id*, oldest first.
+
+        Public read API over ``temporal.fact_history``: walks
+        ``superseded_by`` both directions from *fact_id* so callers can pass
+        any fact in a chain and get the same complete history back.
+        """
+        if not self._store:
+            return []
+        with self._store._lock:
+            return fact_history(self._store._conn, fact_id)
 
     # ------------------------------------------------------------------
     # Maintenance: rebuild_embeddings

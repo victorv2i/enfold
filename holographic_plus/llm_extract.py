@@ -295,6 +295,8 @@ def insert_facts(
     facts: List[Dict[str, str]],
     embed_callback=None,  # optional: callable(fact_id, content) to trigger embedding
     dedup_check=None,  # optional: callable(content, category=...) -> existing fact dict or None
+    update_check=None,  # optional: callable(content, category=...) -> existing fact dict or None
+    supersede=None,  # optional: callable(old_fact_id, new_fact_id) -> None
 ) -> int:
     """Insert extracted facts into the store; returns the number stored.
 
@@ -306,6 +308,12 @@ def insert_facts(
     one the interactive fact_store "add" action uses), each fact is checked
     against the store before insert so extraction never floods the store with
     duplicates the interactive path would have caught.
+
+    When *update_check* and *supersede* are both given, a fact that is not a
+    duplicate but a VALUE UPDATE of an existing fact (same content words, a
+    changed concrete value) triggers *supersede* on the existing fact after
+    the new one is inserted, so extraction gets the same invalidate-not-delete
+    behaviour as the interactive fact_store "add" action.
     """
     inserted = 0
     for fact in facts:
@@ -318,6 +326,9 @@ def insert_facts(
                         dup.get("fact_id"), fact["content"][:80],
                     )
                     continue
+            update_target = None
+            if update_check is not None and supersede is not None:
+                update_target = update_check(fact["content"], category=fact["category"])
             fact_id = store.add_fact(
                 fact["content"],
                 category=fact["category"],
@@ -329,6 +340,11 @@ def insert_facts(
                     embed_callback(fact_id, fact["content"])
                 except Exception as emb_exc:
                     logger.debug("llm_extract: embed callback failed for %d: %s", fact_id, emb_exc)
+            if update_target is not None and fact_id and int(update_target["fact_id"]) != int(fact_id):
+                try:
+                    supersede(int(update_target["fact_id"]), int(fact_id))
+                except Exception as sup_exc:
+                    logger.debug("llm_extract: supersede callback failed for %d: %s", fact_id, sup_exc)
         except Exception as exc:
             logger.debug("llm_extract: add_fact failed: %s", exc)
 
