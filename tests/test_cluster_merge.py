@@ -7,6 +7,7 @@ trust*retrieval/earliest), the merge plan, and the guard rails on execution
 default).
 """
 
+import os
 import sqlite3
 
 import numpy as np
@@ -249,6 +250,33 @@ def test_execute_merge_refuses_live_hermes_path(tmp_path):
                       expected_drop_min=0, expected_drop_max=10)
 
 
+def test_execute_merge_refuses_live_hermes_path_via_symlink(tmp_path):
+    # A symlink whose own literal path does NOT contain ".hermes" but which
+    # resolves into a real .hermes directory must be refused just like a
+    # direct literal path would be.
+    real_hermes_dir = tmp_path / "real_store" / ".hermes"
+    real_hermes_dir.mkdir(parents=True)
+    real_db = real_hermes_dir / "memory_store.db"
+    conn = sqlite3.connect(str(real_db))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_SCHEMA)
+    conn.commit()
+    conn.close()
+
+    sneaky_link = tmp_path / "sneaky_link"
+    os.symlink(real_hermes_dir, sneaky_link)
+    db_path = sneaky_link / "memory_store.db"
+    assert ".hermes" not in str(db_path).split("/")
+
+    with pytest.raises(GuardRailError, match="hermes"):
+        execute_merge(str(db_path), threshold=0.92,
+                      flood_cutoff="2026-06-29 18:00:00",
+                      embedding_identity=_ID,
+                      backup_path=str(tmp_path / "nope.backup"),
+                      dry_run=False,
+                      expected_drop_min=0, expected_drop_max=10)
+
+
 def test_execute_merge_refuses_without_backup_file(tmp_path):
     db_path = tmp_path / "store.db"
     conn = sqlite3.connect(str(db_path))
@@ -284,6 +312,34 @@ def test_execute_merge_refuses_when_drop_count_outside_band(tmp_path):
                       backup_path=str(tmp_path / "store.db.backup"),
                       dry_run=False,
                       expected_drop_min=5, expected_drop_max=10)
+
+
+def test_execute_merge_refuses_when_drop_count_exceeds_relative_cap(tmp_path):
+    # 10 active facts total: one cluster of 7 near-identical facts (6 losers,
+    # 1 survivor) plus 3 standalone facts. 6 drops / 10 active facts = 60%,
+    # under the absolute band [0, 10000] but over the default 0.5 relative
+    # cap, so this must be refused even though the absolute check would pass.
+    db_path = tmp_path / "store.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_SCHEMA)
+    conn.commit()
+
+    for i in range(7):
+        fid = _add_fact(conn, f"restatement {i}", f"2026-06-30 05:0{i}:00")
+        _embed(conn, fid, _vec(1.0, 0.0001 * i), identity=_ID)
+    for i in range(3):
+        _add_fact(conn, f"standalone fact {i}", f"2026-06-30 05:1{i}:00")
+    conn.close()
+    (tmp_path / "store.db.backup").write_bytes(b"x")
+
+    with pytest.raises(GuardRailError, match="relative"):
+        execute_merge(str(db_path), threshold=0.9,
+                      flood_cutoff="2026-06-29 18:00:00",
+                      embedding_identity=_ID,
+                      backup_path=str(tmp_path / "store.db.backup"),
+                      dry_run=False,
+                      expected_drop_min=0, expected_drop_max=10_000)
 
 
 def test_execute_merge_real_run_deletes_losers_and_checkpoints(tmp_path):

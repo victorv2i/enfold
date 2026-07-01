@@ -17,10 +17,15 @@ Survivor selection:
 
 Guard rails on ``execute_merge``:
     - ``dry_run`` defaults to True. A real run must be requested explicitly.
-    - Refuses any *db_path* under a ``.hermes`` directory, live or not.
+    - Refuses any *db_path* under a ``.hermes`` directory, live or not,
+      checking both the literal path and its resolved (realpath) form so a
+      symlink cannot bypass the check.
     - Requires *backup_path* to already exist on disk.
     - Refuses unless the computed drop count falls within
       [*expected_drop_min*, *expected_drop_max*].
+    - Refuses if the computed drop count exceeds *max_drop_fraction*
+      (default 0.5) of the starting active fact count, even if it is
+      within the absolute band above.
     - A real run ends with ``PRAGMA integrity_check`` and an FTS5 integrity
       check, plus ``PRAGMA wal_checkpoint(TRUNCATE)``.
 """
@@ -28,11 +33,10 @@ Guard rails on ``execute_merge``:
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
-
-import numpy as np
 
 from .embed_store import EmbedStore
 
@@ -244,8 +248,9 @@ class MergeResult:
 
 
 def _refuse_if_live_path(db_path: str) -> None:
-    parts = str(db_path).replace("\\", "/").split("/")
-    if ".hermes" in parts:
+    literal_parts = str(db_path).replace("\\", "/").split("/")
+    resolved_parts = os.path.realpath(db_path).replace("\\", "/").split("/")
+    if ".hermes" in literal_parts or ".hermes" in resolved_parts:
         raise GuardRailError(
             f"refusing to run against a path under .hermes ({db_path}); "
             "this tool only ever runs against a copy"
@@ -262,14 +267,18 @@ def execute_merge(
     expected_drop_max: int,
     dry_run: bool = True,
     suspicious_cluster_size: int = 25,
+    max_drop_fraction: float = 0.5,
 ) -> MergeResult:
     """Plan and (optionally) execute the merge against *db_path*.
 
     Always refuses a path under ``.hermes``. A non-dry-run additionally
     requires *backup_path* to exist and the computed drop count to fall
-    inside [*expected_drop_min*, *expected_drop_max*], then deletes losers,
-    merges their counts/tags onto each survivor, drops their embeddings, and
-    runs an integrity check + wal_checkpoint.
+    inside [*expected_drop_min*, *expected_drop_max*] AND to not exceed
+    *max_drop_fraction* of the starting active fact count (default 0.5, i.e.
+    refuse a plan that would drop more than half the store even if it is
+    still within the absolute band), then deletes losers, merges their
+    counts/tags onto each survivor, drops their embeddings, and runs an
+    integrity check + wal_checkpoint.
     """
     _refuse_if_live_path(db_path)
 
@@ -283,7 +292,6 @@ def execute_merge(
         )
 
         if not dry_run:
-            import os
             if not os.path.exists(backup_path):
                 raise GuardRailError(
                     f"refusing to run: backup file does not exist ({backup_path})"
@@ -292,6 +300,14 @@ def execute_merge(
                 raise GuardRailError(
                     f"refusing to run: drop count {plan.drop_count} is outside "
                     f"the expected band [{expected_drop_min}, {expected_drop_max}]"
+                )
+            if plan.starting_fact_count > 0 and (
+                plan.drop_count > max_drop_fraction * plan.starting_fact_count
+            ):
+                raise GuardRailError(
+                    f"refusing to run: drop count {plan.drop_count} exceeds the "
+                    f"relative cap of {max_drop_fraction:.0%} of the "
+                    f"{plan.starting_fact_count} active facts"
                 )
             _apply_merge(conn, plan)
             integrity_ok = _integrity_check(conn)
@@ -380,6 +396,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          help="path to a pre-existing backup of db_path (required for --execute)")
     parser.add_argument("--expected-drop-min", type=int, default=0)
     parser.add_argument("--expected-drop-max", type=int, default=10_000)
+    parser.add_argument("--max-drop-fraction", type=float, default=0.5,
+                         help="refuse if drop count exceeds this fraction of active facts (default 0.5)")
     parser.add_argument("--execute", action="store_true",
                          help="actually perform the merge (default is dry-run)")
     args = parser.parse_args(argv)
@@ -392,6 +410,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         backup_path=args.backup_path,
         expected_drop_min=args.expected_drop_min,
         expected_drop_max=args.expected_drop_max,
+        max_drop_fraction=args.max_drop_fraction,
         dry_run=not args.execute,
     )
     print(result)
