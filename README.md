@@ -13,6 +13,7 @@ It does not replace the holographic provider, it subclasses it. All the holograp
 - **LLM fact extraction.** At session end (and just before context compression) it extracts durable, atomic facts from the conversation so nothing important is lost when the window rolls over. Extraction uses your agent's own model by default, no hardcoded provider, and is configurable.
 - **Reliable extraction pipeline.** Transcripts are persisted to an on-disk queue and processed by a background worker, so extraction survives crashes and restarts and never blocks the session (see Reliability below).
 - **Graceful fallback.** If the embedding backend is unreachable, it silently falls back to holographic-only scoring, never a hard failure.
+- **Entity-graph boost (off by default).** The base store already links facts to entities it recognises in their text. When enabled, a query mentioning one of those entities boosts facts linked to it, and can optionally expand one hop to related facts that share the entity but have no lexical overlap with the query. High-degree "hub" entities (e.g. the user's own name) are excluded from expansion so they can't flood the results.
 
 ## Requirements
 
@@ -53,6 +54,9 @@ plugins:
     # retrieval_decision_min_score: 0.5      # drop candidates below this final score when enabled
     # retrieval_decision_min_margin: 0.02    # abstain when top-2 filtered scores are too close
     # retrieval_decision_min_trust: 0.5      # drop candidates below this trust when enabled
+    entity_boost_weight: 0.0                # additive boost for facts linked to a query-mentioned entity (default off)
+    entity_expansion: false                 # 1-hop expansion to facts sharing an entity with a top hit (default off)
+    entity_hub_degree_limit: 25             # entities linked to more facts than this are excluded from expansion
     embed_on_add: true                      # embed a fact immediately when it is added
     fastembed_model: BAAI/bge-base-en-v1.5  # 768-dim, local
     ollama_url: http://localhost:11434      # only if embedding_backend: ollama

@@ -21,6 +21,9 @@ Config (same ``plugins.hermes-memory-store`` block, extra keys):
         dedup_cosine: 0.92               # dense cosine needed to call a paraphrase a duplicate (same values required)
         extract_drain_batch: 5           # extraction queue rows processed per drain tick (default 5)
         # extraction_provider / extraction_model: default to the host agent's model
+        entity_boost_weight: 0.0         # additive boost for facts linked to a query-mentioned entity (default off)
+        entity_expansion: false          # 1-hop expansion to facts sharing an entity with a top hit (default off)
+        entity_hub_degree_limit: 25      # entities linked to more facts than this are excluded from expansion
 
 Retrieval weights:
     The holographic signals (defaults FTS=0.3, Jaccard=0.2, HRR=0.2) are
@@ -417,6 +420,9 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             jaccard_weight=jaccard_w,
             hrr_weight=hrr_w,
             hrr_dim=hrr_dim,
+            entity_boost_weight=float(self._config.get("entity_boost_weight", 0.0)),
+            entity_expansion=_cfg_bool(self._config.get("entity_expansion"), False),
+            entity_hub_degree_limit=int(self._config.get("entity_hub_degree_limit", 25)),
         )
 
         # ---- Embedding layer

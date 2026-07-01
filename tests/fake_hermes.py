@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import struct
 import sys
@@ -101,6 +102,11 @@ def _build_hrr_module() -> types.ModuleType:
 
 hrr = _build_hrr_module()
 
+# Mirrors store.py's _RE_CAPITALIZED entity-extraction rule: multi-word
+# capitalized phrases only (single capitalized words are too noisy to
+# reliably identify an entity).
+_RE_CAPITALIZED = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
+
 
 # ---------------------------------------------------------------------------
 # MemoryStore (mirrors plugins/memory/holographic/store.py essentials)
@@ -119,6 +125,22 @@ CREATE TABLE IF NOT EXISTS facts (
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     hrr_vector      BLOB
 );
+
+CREATE TABLE IF NOT EXISTS entities (
+    entity_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    entity_type TEXT DEFAULT 'unknown',
+    aliases     TEXT DEFAULT '',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS fact_entities (
+    fact_id   INTEGER REFERENCES facts(fact_id),
+    entity_id INTEGER REFERENCES entities(entity_id),
+    PRIMARY KEY (fact_id, entity_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
     USING fts5(content, tags, content=facts, content_rowid=fact_id);
@@ -181,9 +203,40 @@ class MemoryStore:
                     "SELECT fact_id FROM facts WHERE content = ?", (content,)
                 ).fetchone()
                 return int(row["fact_id"])
+            for name in self._extract_entities(content):
+                entity_id = self._resolve_entity(name)
+                self._link_fact_entity(fact_id, entity_id)
             self._compute_hrr_vector(fact_id, content)
             self._rebuild_bank(category)
             return fact_id
+
+    def _extract_entities(self, text: str) -> list:
+        """Multi-word capitalized phrases only (mirrors store.py)."""
+        seen: set = set()
+        candidates: list = []
+        for m in _RE_CAPITALIZED.finditer(text):
+            name = m.group(1).strip()
+            if name and name.lower() not in seen:
+                seen.add(name.lower())
+                candidates.append(name)
+        return candidates
+
+    def _resolve_entity(self, name: str) -> int:
+        row = self._conn.execute(
+            "SELECT entity_id FROM entities WHERE name LIKE ?", (name,)
+        ).fetchone()
+        if row is not None:
+            return int(row["entity_id"])
+        cur = self._conn.execute("INSERT INTO entities (name) VALUES (?)", (name,))
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def _link_fact_entity(self, fact_id: int, entity_id: int) -> None:
+        self._conn.execute(
+            "INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)",
+            (fact_id, entity_id),
+        )
+        self._conn.commit()
 
     def update_fact(self, fact_id, content=None, trust_delta=None, tags=None, category=None) -> bool:
         with self._lock:

@@ -48,7 +48,29 @@ _FTS_STOPWORDS = frozenset(
 
 
 class PlusFactRetriever(FactRetriever):
-    """FactRetriever with a single query encode and lean candidate fetch."""
+    """FactRetriever with a single query encode, lean candidate fetch, and an
+    optional entity-graph boost/expansion layer (both off by default)."""
+
+    def __init__(
+        self,
+        *args,
+        entity_boost_weight: float = 0.0,
+        entity_expansion: bool = False,
+        entity_hub_degree_limit: int = 25,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        # Additive relevance boost for facts linked to a query-mentioned
+        # entity: 0.0 (default) reproduces the parent's ranking exactly.
+        self.entity_boost_weight = entity_boost_weight
+        # 1-hop expansion: pull in facts that share an entity with a top hit
+        # but have no lexical/HRR overlap with the query at all. Off by
+        # default since it changes recall, not just ranking.
+        self.entity_expansion = entity_expansion
+        # An entity linked to more than this many facts is a "hub" (e.g. the
+        # user's own name) and is excluded from expansion so it doesn't flood
+        # results with unrelated facts.
+        self.entity_hub_degree_limit = entity_hub_degree_limit
 
     def search(
         self,
@@ -60,8 +82,9 @@ class PlusFactRetriever(FactRetriever):
         """Hybrid search mirroring the parent pipeline exactly.
 
         1. FTS5 candidates (limit * 3, lean columns)
-        2. Jaccard + FTS + HRR relevance, trust weighted
+        2. Jaccard + FTS + HRR relevance, trust weighted, optional entity boost
         3. Optional temporal decay
+        4. Optional 1-hop entity expansion, ranked below the direct hits
         """
         candidates = self._fts_candidates(query, category, min_trust, limit * 3)
         if not candidates:
@@ -77,6 +100,15 @@ class PlusFactRetriever(FactRetriever):
             hrr_vectors = self._load_hrr_vectors([f["fact_id"] for f in candidates])
             if hrr_vectors:
                 query_vec = hrr.encode_text(query, self.hrr_dim)
+
+        # Entity boost is additive to `relevance` (same scale as fts/jaccard/hrr,
+        # each already in [0, 1]) so entity_boost_weight partitions cleanly
+        # alongside the other weights instead of needing its own rescale.
+        # Skipped entirely when the weight is 0.0, so byte-identical to the
+        # parent's ranking by default (no query, no DB round trip).
+        candidate_entities: Dict[int, set] = {}
+        if self.entity_boost_weight > 0 or self.entity_expansion:
+            candidate_entities = self._load_fact_entities([f["fact_id"] for f in candidates])
 
         scored = []
         for fact in candidates:
@@ -99,6 +131,12 @@ class PlusFactRetriever(FactRetriever):
                          + self.jaccard_weight * jaccard
                          + self.hrr_weight * hrr_sim)
 
+            if self.entity_boost_weight > 0:
+                entity_overlap = self._entity_overlap(
+                    query_tokens, candidate_entities.get(fact["fact_id"], set())
+                )
+                relevance += self.entity_boost_weight * entity_overlap
+
             score = relevance * fact["trust_score"]
 
             if self.half_life > 0:
@@ -108,8 +146,158 @@ class PlusFactRetriever(FactRetriever):
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        # Candidates never carried hrr_vector, so no blob stripping is needed.
-        return scored[:limit]
+        direct = scored[:limit]
+
+        if not self.entity_expansion or not direct:
+            # Candidates never carried hrr_vector, so no blob stripping needed.
+            return direct
+
+        expanded = self._expand_via_entities(
+            direct, candidate_entities, category, min_trust, limit
+        )
+        return (direct + expanded)[:limit]
+
+    # ------------------------------------------------------------------
+    # Entity graph
+    # ------------------------------------------------------------------
+
+    def _load_fact_entities(self, fact_ids: List[int]) -> Dict[int, set]:
+        """Return ``{fact_id: {lowercased entity name, ...}}`` for *fact_ids*."""
+        if not fact_ids:
+            return {}
+        conn = self.store._conn
+        placeholders = ",".join("?" * len(fact_ids))
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT fe.fact_id, e.name FROM fact_entities fe
+                JOIN entities e ON e.entity_id = fe.entity_id
+                WHERE fe.fact_id IN ({placeholders})
+                """,
+                list(fact_ids),
+            ).fetchall()
+        except Exception:
+            return {}
+        out: Dict[int, set] = {}
+        for row in rows:
+            out.setdefault(int(row["fact_id"]), set()).add(row["name"].lower())
+        return out
+
+    @staticmethod
+    def _entity_overlap(query_tokens: set, entity_names: set) -> float:
+        """Fraction of *entity_names* that the query actually mentions.
+
+        Cheap token-overlap match (no LLM/NER): an entity counts as mentioned
+        when every word of its name appears among the query tokens, so
+        "Victor Iglesias" matches a query containing both words. Returns 0.0
+        when the fact has no linked entities.
+        """
+        if not entity_names:
+            return 0.0
+        hits = sum(
+            1 for name in entity_names
+            if name.split() and set(name.split()) <= query_tokens
+        )
+        return hits / len(entity_names)
+
+    def _entity_degrees(self, entity_names: set) -> Dict[str, int]:
+        """Return ``{lowercased entity name: linked fact count}`` for *entity_names*."""
+        if not entity_names:
+            return {}
+        conn = self.store._conn
+        placeholders = ",".join("?" * len(entity_names))
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT e.name, COUNT(*) AS degree
+                FROM fact_entities fe
+                JOIN entities e ON e.entity_id = fe.entity_id
+                WHERE LOWER(e.name) IN ({placeholders})
+                GROUP BY e.entity_id
+                """,
+                list(entity_names),
+            ).fetchall()
+        except Exception:
+            return {}
+        return {row["name"].lower(): int(row["degree"]) for row in rows}
+
+    def _expand_via_entities(
+        self,
+        direct: List[dict],
+        candidate_entities: Dict[int, set],
+        category: Optional[str],
+        min_trust: float,
+        limit: int,
+    ) -> List[dict]:
+        """1-hop expansion: facts sharing a non-hub entity with a direct hit.
+
+        Only entities attached to the *direct* results are followed (not every
+        candidate), so expansion stays anchored to what actually matched the
+        query. Hub entities (linked to more than ``entity_hub_degree_limit``
+        facts) are excluded so a ubiquitous entity like the user's own name
+        cannot flood the results. Returned facts are marked
+        ``expanded_from_entity`` and never outrank a direct hit (the caller
+        appends this list after ``direct``).
+        """
+        direct_ids = {f["fact_id"] for f in direct}
+        seed_entities: set = set()
+        for fact in direct:
+            seed_entities |= candidate_entities.get(fact["fact_id"], set())
+        if not seed_entities:
+            return []
+
+        degrees = self._entity_degrees(seed_entities)
+        expandable = {
+            name for name in seed_entities
+            if degrees.get(name, 0) <= self.entity_hub_degree_limit
+        }
+        if not expandable:
+            return []
+
+        conn = self.store._conn
+        placeholders = ",".join("?" * len(expandable))
+        params: list = list(expandable)
+        where_clauses = [f"LOWER(e.name) IN ({placeholders})", "f.trust_score >= ?"]
+        params.append(min_trust)
+        if category:
+            where_clauses.append("f.category = ?")
+            params.append(category)
+        where_sql = " AND ".join(where_clauses)
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT f.fact_id, f.content, f.category, f.tags,
+                       f.trust_score, f.retrieval_count, f.helpful_count,
+                       f.created_at, f.updated_at, e.name AS via_entity
+                FROM fact_entities fe
+                JOIN entities e ON e.entity_id = fe.entity_id
+                JOIN facts f ON f.fact_id = fe.fact_id
+                WHERE {where_sql}
+                """,
+                params,
+            ).fetchall()
+        except Exception:
+            return []
+
+        expanded: List[dict] = []
+        seen: set = set()
+        for row in rows:
+            fid = int(row["fact_id"])
+            if fid in direct_ids or fid in seen:
+                continue
+            seen.add(fid)
+            fact = dict(row)
+            fact.pop("via_entity", None)
+            fact["expanded_from_entity"] = row["via_entity"]
+            # Ranked strictly below every direct hit: trust-scaled but capped
+            # under the lowest direct score so expansion can never displace a
+            # real match, only supplement it.
+            floor = min((f["score"] for f in direct), default=0.0)
+            fact["score"] = min(floor, self.entity_boost_weight * fact["trust_score"])
+            expanded.append(fact)
+
+        expanded.sort(key=lambda x: x["score"], reverse=True)
+        return expanded[: max(0, limit - len(direct))]
 
     def _load_hrr_vectors(self, fact_ids: List[int]) -> Dict[int, bytes]:
         """Fetch hrr_vector blobs for *fact_ids* in a single query."""
