@@ -25,6 +25,11 @@ Config (same ``plugins.hermes-memory-store`` block, extra keys):
         entity_boost_weight: 0.0         # additive boost for facts linked to a query-mentioned entity (default off)
         entity_expansion: false          # 1-hop expansion to facts sharing an entity with a top hit (default off)
         entity_hub_degree_limit: 25      # entities linked to more facts than this are excluded from expansion
+        reflection_enabled: false        # sleep-time reflection: synthesize insights from related facts (default off)
+        reflection_interval_hours: 24    # minimum hours between reflection passes, persisted across restarts
+        reflection_max_clusters: 3       # candidate clusters considered per reflection pass
+        reflection_cosine_low: 0.75      # lower cosine bound for a "related" (non-duplicate) cluster
+        reflection_cosine_high: 0.92     # upper cosine bound; at/above this the dedup gate already owns it
 
 Retrieval weights:
     The holographic signals (defaults FTS=0.3, Jaccard=0.2, HRR=0.2) are
@@ -163,6 +168,7 @@ def _is_superseded(content: str) -> bool:
 from .embed_store import EmbedStore
 from .extract_queue import ExtractQueue, is_quota_error, quota_retry_delay
 from .llm_extract import _format_conversation, extract_facts_from_transcript, insert_facts
+from .reflection import ensure_reflection_schema, invalidate_insights_citing, run_reflection
 from .retrieval_plus import PlusFactRetriever
 from .temporal import ensure_temporal_schema, fact_history, find_value_update_target, supersede
 
@@ -327,6 +333,14 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         # of firing the extraction LLM back-to-back for the whole backlog.
         self._extract_drain_batch: int = int(cfg.get("extract_drain_batch", 5))
 
+        # Sleep-time reflection: opt-in connection-drawing insight layer.
+        # Off by default; a deployer enables it explicitly in config.
+        self._reflection_enabled: bool = _cfg_bool(cfg.get("reflection_enabled"), False)
+        self._reflection_interval_hours: float = float(cfg.get("reflection_interval_hours", 24))
+        self._reflection_max_clusters: int = int(cfg.get("reflection_max_clusters", 3))
+        self._reflection_cosine_low: float = float(cfg.get("reflection_cosine_low", 0.75))
+        self._reflection_cosine_high: float = float(cfg.get("reflection_cosine_high", 0.92))
+
     # ------------------------------------------------------------------
     # Embedding backend helpers
     # ------------------------------------------------------------------
@@ -402,6 +416,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         # safe to run on every initialize() including a re-init against the
         # same store.
         ensure_temporal_schema(self._store._conn)
+        ensure_reflection_schema(self._store._conn)
 
         if prev_store is not None and prev_store is not self._store:
             if prev_quiescent:
@@ -685,6 +700,11 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 self._drain_extract_queue(stop, queue)
             except Exception as exc:
                 logger.warning("holographic_plus: extraction queue drain failed: %s", exc)
+            if self._reflection_enabled:
+                try:
+                    self.run_reflection(time.time())
+                except Exception as exc:
+                    logger.warning("holographic_plus: reflection pass failed: %s", exc)
             # Periodic backfill: re-embeds facts whose per-fact embed attempt
             # failed (transient backend errors are otherwise silently dropped).
             if time.monotonic() - last_backfill >= self._backfill_interval:
@@ -1361,6 +1381,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         try:
             with self._store._lock:
                 supersede(self._store._conn, old_fact_id, new_fact_id)
+                invalidate_insights_citing(self._store._conn, old_fact_id)
         except Exception as exc:
             logger.debug(
                 "holographic_plus: supersede(%s -> %s) failed: %s",
@@ -1378,6 +1399,55 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             return []
         with self._store._lock:
             return fact_history(self._store._conn, fact_id)
+
+    # ------------------------------------------------------------------
+    # Sleep-time reflection: connection-drawing insight layer
+    # ------------------------------------------------------------------
+
+    def run_reflection(self, now: float) -> int:
+        """Run one opportunistic reflection pass; returns insights inserted.
+
+        Called from the same background loop that drains the extraction
+        queue. Inert when ``reflection_enabled`` is false (the default) or no
+        extraction model is configured (reflection reuses the same host-LLM
+        plumbing). The min-interval clock is persisted in the store, so a
+        restart never resets it.
+        """
+        if not self._store or not self._reflection_enabled:
+            return 0
+        if not self._extract_provider or not self._extract_model:
+            return 0
+        return run_reflection(
+            self._store._conn,
+            now=now,
+            enabled=self._reflection_enabled,
+            interval_hours=self._reflection_interval_hours,
+            max_clusters=self._reflection_max_clusters,
+            provider=self._extract_provider,
+            model=self._extract_model,
+            effort=self._extract_effort,
+            embed_store=self._embed_store if self._embedder_available else None,
+            embedding_identity=self._embedding_identity("document"),
+            cosine_low=self._reflection_cosine_low,
+            cosine_high=self._reflection_cosine_high,
+            entity_hub_degree_limit=int(self._config.get("entity_hub_degree_limit", 25)),
+            dedup_check=self._find_near_duplicate if self._dedup_on_add else None,
+            insert_fact=self._insert_reflection_fact,
+            lock=getattr(self._store, "_lock", None),
+        )
+
+    def _insert_reflection_fact(self, content: str, category: str, tags: str) -> int:
+        """Insert one accepted insight through the normal fact-add path.
+
+        Reuses ``store.add_fact`` (so entity linking runs exactly as for any
+        other fact) and triggers the same embed callback the extraction
+        queue uses, so an insight is retrievable by dense similarity like
+        everything else.
+        """
+        fact_id = self._store.add_fact(content, category=category, tags=tags)
+        if fact_id:
+            self._embed_cb(fact_id, content)
+        return fact_id
 
     # ------------------------------------------------------------------
     # Maintenance: rebuild_embeddings
