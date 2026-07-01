@@ -1031,6 +1031,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         min_trust: float = 0.3,
         limit: int = 10,
         bump: bool = True,
+        explain: bool = False,
     ) -> List[Dict[str, Any]]:
         """Hybrid search: holographic pipeline + embedding similarity.
 
@@ -1038,6 +1039,13 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         2. If Ollama is available: embed query, score all stored embeddings,
            merge scores.
         3. Re-rank and return top *limit* results.
+
+        When *explain* is true, every candidate considered (including ones
+        excluded by the superseded/temporal filters or dropped past *limit*)
+        is returned, each carrying an ``excluded`` reason (None if kept) and
+        the component scores that fed its final blend. This is the same
+        scoring pass as a normal call, just with nothing thrown away, so the
+        included rows and their scores are identical to a plain search().
         """
         # --- Step 1: holographic candidates (get more for re-ranking headroom)
         holo_results = self._retriever.search(
@@ -1045,18 +1053,31 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             category=category,
             min_trust=min_trust,
             limit=limit * 3,
+            explain=explain,
         )
-        # Exclude explicitly-superseded facts from retrieval (demote-not-delete
-        # only works if reads skip them; trust demotion alone proved unreliable).
-        holo_results = [r for r in holo_results if not _is_superseded(r.get("content", ""))]
+        excluded: Dict[int, Dict[str, Any]] = {}
+        kept = []
+        for r in holo_results:
+            if _is_superseded(r.get("content", "")):
+                excluded[r["fact_id"]] = {"reason": "superseded", "content": r.get("content")}
+            else:
+                kept.append(r)
+        holo_results = kept
         if self._temporal_filter:
-            holo_results = self._exclude_temporally_invalid(holo_results)
+            holo_results, invalid_facts = self._exclude_temporally_invalid(
+                holo_results, return_excluded=True
+            )
+            for r in invalid_facts:
+                excluded[r["fact_id"]] = {"reason": "temporally_invalid", "content": r.get("content")}
 
         if not self._embedder_available or not self._embed_store or not self._embedder:
             # Pure holographic fallback
-            selected = self._apply_retrieval_decision(holo_results)[:limit]
+            selected = self._apply_retrieval_decision(holo_results)
             for r in selected:
                 r["embedding_score"] = None
+            if explain:
+                return self._build_explain_rows(selected, excluded, limit)
+            selected = selected[:limit]
             if bump:
                 self._bump_retrieval_counts(selected)
             return selected
@@ -1069,9 +1090,12 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             query_vec = None
 
         if query_vec is None:
-            selected = self._apply_retrieval_decision(holo_results)[:limit]
+            selected = self._apply_retrieval_decision(holo_results)
             for r in selected:
                 r["embedding_score"] = None
+            if explain:
+                return self._build_explain_rows(selected, excluded, limit)
+            selected = selected[:limit]
             if bump:
                 self._bump_retrieval_counts(selected)
             return selected
@@ -1127,8 +1151,10 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             for row in rows:
                 d = dict(row)
                 if _is_superseded(d.get("content", "")):
+                    excluded[d["fact_id"]] = {"reason": "superseded", "content": d.get("content")}
                     continue
                 if self._temporal_filter and d.pop("invalid_at", None) is not None:
+                    excluded[d["fact_id"]] = {"reason": "temporally_invalid", "content": d.get("content")}
                     continue
                 d.pop("invalid_at", None)
                 d["score"] = 0.0  # no holographic score
@@ -1141,8 +1167,13 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             holo_score = fact.get("score", 0.0)  # parent relevance × trust, in [0, trust]
             raw_emb_sim = emb_scores.get(fid)
 
+            if explain:
+                fact.setdefault("_breakdown", {})["holo_score"] = holo_score
             fact["score"] = _blend_score(holo_score, raw_emb_sim, ew)
             fact["embedding_score"] = round(raw_emb_sim, 4) if raw_emb_sim is not None else None
+            if explain:
+                fact["_breakdown"]["raw_embedding_cosine"] = raw_emb_sim
+                fact["_breakdown"]["embedding_weight"] = ew
 
             merged.append(fact)
 
@@ -1164,12 +1195,82 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 seen.add(f["fact_id"])
                 unique.append(f)
 
-        selected = self._apply_retrieval_decision(unique)[:limit]
+        selected = self._apply_retrieval_decision(unique)
+        if explain:
+            return self._build_explain_rows(selected, excluded, limit)
+        selected = selected[:limit]
         if bump:
             self._bump_retrieval_counts(selected)
         return selected
 
-    def _exclude_temporally_invalid(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _build_explain_rows(
+        self,
+        ranked: List[Dict[str, Any]],
+        excluded: Dict[int, Dict[str, Any]],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Flatten *ranked* (already sorted, decision-filtered) plus any
+        *excluded* fact_ids into one diagnostic list: kept rows first (rank
+        1..limit), any rows past *limit* marked "past_limit", then excluded
+        rows with their reason. Never bumps retrieval counts (read-only).
+        """
+        rows: List[Dict[str, Any]] = []
+        for i, fact in enumerate(ranked):
+            breakdown = fact.get("_breakdown", {})
+            past_limit = i >= limit
+            rows.append({
+                "fact_id": fact["fact_id"],
+                "content": fact.get("content", ""),
+                "rank": i + 1 if not past_limit else None,
+                "fts_score": breakdown.get("fts_score"),
+                "jaccard_score": breakdown.get("jaccard_score"),
+                "hrr_score": breakdown.get("hrr_score"),
+                "entity_boost": breakdown.get("entity_boost"),
+                "trust_score": fact.get("trust_score"),
+                "raw_embedding_cosine": breakdown.get("raw_embedding_cosine", fact.get("embedding_score")),
+                "embedding_contribution": (
+                    None if breakdown.get("raw_embedding_cosine") is None
+                    else breakdown.get("embedding_weight", self._embed_weight)
+                    * ((breakdown["raw_embedding_cosine"] + 1.0) / 2.0)
+                ),
+                "holo_score": breakdown.get("holo_score", fact.get("score")),
+                "final_score": fact.get("score"),
+                "excluded": "past_limit" if past_limit else None,
+            })
+        for fid, info in excluded.items():
+            rows.append({
+                "fact_id": fid,
+                "content": info.get("content"),
+                "rank": None,
+                "fts_score": None,
+                "jaccard_score": None,
+                "hrr_score": None,
+                "entity_boost": None,
+                "trust_score": None,
+                "raw_embedding_cosine": None,
+                "embedding_contribution": None,
+                "holo_score": None,
+                "final_score": None,
+                "excluded": info.get("reason"),
+            })
+        return rows
+
+    def explain_search(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Recall diagnostics: per-candidate scoring breakdown for *query*.
+
+        Reuses the exact search() scoring pass (holographic components +
+        embedding blend + temporal/superseded filtering) with nothing
+        thrown away, so it can never drift from real ranking. Returns the
+        kept results (rank 1..limit, ``excluded`` is None) followed by
+        candidates dropped for a reason (``excluded`` is "superseded",
+        "temporally_invalid", or "past_limit"). Read-only: never bumps
+        retrieval_count.
+        """
+        return self.search(query, min_trust=0.0, limit=limit, bump=False, explain=True)
+
+    def _exclude_temporally_invalid(
+        self, results: List[Dict[str, Any]], return_excluded: bool = False
+    ):
         """Drop rows whose fact has been structurally superseded (invalid_at set).
 
         ``_retriever.search()`` candidate rows don't carry ``invalid_at`` (see
@@ -1177,9 +1278,13 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         query over the candidate fact_ids rather than changing the parent's
         candidate SQL. Degrades to returning *results* unchanged on error, so
         a lookup failure never breaks search.
+
+        When *return_excluded* is true, returns a ``(kept, excluded_facts)``
+        tuple instead of just the kept list, for callers building a
+        diagnostic view of what was filtered out and why.
         """
         if not results or not self._store:
-            return results
+            return (results, []) if return_excluded else results
         ids = [int(r["fact_id"]) for r in results]
         try:
             placeholders = ",".join("?" * len(ids))
@@ -1191,11 +1296,13 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 ).fetchall()
         except Exception as exc:
             logger.debug("holographic_plus: temporal filter lookup failed: %s", exc)
-            return results
+            return (results, []) if return_excluded else results
         invalid_ids = {int(r["fact_id"]) for r in rows}
         if not invalid_ids:
-            return results
-        return [r for r in results if r["fact_id"] not in invalid_ids]
+            return (results, []) if return_excluded else results
+        kept = [r for r in results if r["fact_id"] not in invalid_ids]
+        excluded_facts = [r for r in results if r["fact_id"] in invalid_ids]
+        return (kept, excluded_facts) if return_excluded else kept
 
     def _apply_retrieval_decision(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Apply optional final-stage confidence gates to ranked search results.

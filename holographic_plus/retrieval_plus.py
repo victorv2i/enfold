@@ -78,6 +78,7 @@ class PlusFactRetriever(FactRetriever):
         category: Optional[str] = None,
         min_trust: float = 0.3,
         limit: int = 10,
+        explain: bool = False,
     ) -> List[dict]:
         """Hybrid search mirroring the parent pipeline exactly.
 
@@ -85,6 +86,12 @@ class PlusFactRetriever(FactRetriever):
         2. Jaccard + FTS + HRR relevance, trust weighted, optional entity boost
         3. Optional temporal decay
         4. Optional 1-hop entity expansion, ranked below the direct hits
+
+        When *explain* is true, each returned fact carries a ``_breakdown``
+        dict with the component scores (fts, jaccard, hrr, entity_boost,
+        relevance, trust_score) that fed into it, computed on the exact same
+        pass as the score itself so a diagnostic view can never drift from
+        real ranking.
         """
         candidates = self._fts_candidates(query, category, min_trust, limit * 3)
         if not candidates:
@@ -131,11 +138,13 @@ class PlusFactRetriever(FactRetriever):
                          + self.jaccard_weight * jaccard
                          + self.hrr_weight * hrr_sim)
 
+            entity_boost = 0.0
             if self.entity_boost_weight > 0:
                 entity_overlap = self._entity_overlap(
                     query_tokens, candidate_entities.get(fact["fact_id"], set())
                 )
-                relevance += self.entity_boost_weight * entity_overlap
+                entity_boost = self.entity_boost_weight * entity_overlap
+                relevance += entity_boost
 
             score = relevance * fact["trust_score"]
 
@@ -143,6 +152,16 @@ class PlusFactRetriever(FactRetriever):
                 score *= self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
 
             fact["score"] = score
+            if explain:
+                fact["_breakdown"] = {
+                    "fts_score": fts_score,
+                    "jaccard_score": jaccard,
+                    "hrr_score": hrr_sim,
+                    "entity_boost": entity_boost,
+                    "relevance": relevance,
+                    "trust_score": fact["trust_score"],
+                    "holo_score": score,
+                }
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
