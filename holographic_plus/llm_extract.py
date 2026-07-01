@@ -38,7 +38,7 @@ RULES:
 6. Assign 2-5 comma-separated tags (lowercase, no spaces).
 7. Do NOT extract facts already obvious from names/dates (e.g. "today is Monday").
 8. Skip anything that's clearly a one-off instruction to the agent for this session.
-9. Emit each distinct fact EXACTLY ONCE. Never output multiple rephrasings or near-duplicates of the same fact (e.g. the same SHA, URL, port, or status stated several ways) — choose the single clearest phrasing.
+9. Emit each distinct fact EXACTLY ONCE. Never output multiple rephrasings or near-duplicates of the same fact (e.g. the same SHA, URL, port, or status stated several ways); choose the single clearest phrasing.
 10. Resolve pronouns and vague references to concrete entities so each fact stands alone out of context.
 11. If a fact corrects or updates something in the known facts, state the new fact with the current value (the system supersedes the old one); do not restate unchanged known facts.
 12. Convert relative time references ("yesterday", "last week", "next month") to absolute dates using TODAY'S DATE (given below), so every fact is unambiguous out of context.
@@ -52,7 +52,7 @@ BAD facts (don't extract):
 - "The user asked me to summarize a document." (ephemeral task)
 - "The conversation was about memory systems." (meta)
 - "The user said hello." (trivial)
-- The same fact restated several ways, e.g. "X is pinned at SHA abc" + "X uses commit abc" + "X's clone is at abc" (duplication — output it once)
+- The same fact restated several ways, e.g. "X is pinned at SHA abc" + "X uses commit abc" + "X's clone is at abc" (duplication, output it once)
 
 OUTPUT: Respond with a JSON array only. No prose, no markdown fences.
 Example:
