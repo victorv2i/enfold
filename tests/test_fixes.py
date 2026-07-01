@@ -50,24 +50,26 @@ def test_extract_json_array_is_balanced_and_first():
 # --- hybrid blend math -----------------------------------------------------
 
 def test_blend_no_embedding_scales_by_one_minus_ew():
-    assert abs(_blend_score(0.5, None, trust=0.8, ew=0.3) - 0.35) < 1e-9
+    assert abs(_blend_score(0.5, None, ew=0.3) - 0.35) < 1e-9
 
 
-def test_blend_perfect_match_equals_trust():
-    trust = 0.9
-    assert abs(_blend_score(trust, 1.0, trust, 0.3) - trust) < 1e-9
+def test_blend_perfect_dense_match_adds_full_slice():
+    # The dense term is no longer trust-weighted, so a perfect cosine adds the
+    # full ew slice on top of the (1-ew) holographic slice.
+    assert abs(_blend_score(0.9, 1.0, 0.3) - (0.7 * 0.9 + 0.3)) < 1e-9
 
 
-def test_blend_embedding_is_trust_weighted():
-    hi = _blend_score(0.0, 1.0, trust=1.0, ew=0.3)
-    lo = _blend_score(0.0, 1.0, trust=0.1, ew=0.3)
-    assert abs(hi - 0.3) < 1e-9 and abs(lo - 0.03) < 1e-9 and hi > lo
+def test_blend_embedding_is_not_trust_weighted():
+    # Trust must NOT scale the dense term: multiplying by trust let high-trust
+    # distractors outrank the correct default-trust fact (~23pts lower recall@1).
+    # Trust influences ranking only through the holographic term now.
+    assert abs(_blend_score(0.0, 1.0, ew=0.3) - 0.3) < 1e-9
 
 
 def test_blend_monotonic_in_similarity():
-    a = _blend_score(0.2, -1.0, 0.7, 0.3)
-    b = _blend_score(0.2, 0.0, 0.7, 0.3)
-    c = _blend_score(0.2, 1.0, 0.7, 0.3)
+    a = _blend_score(0.2, -1.0, 0.3)
+    b = _blend_score(0.2, 0.0, 0.3)
+    c = _blend_score(0.2, 1.0, 0.3)
     assert a < b < c
 
 

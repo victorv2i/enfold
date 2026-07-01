@@ -267,3 +267,42 @@ def test_inserted_facts_get_embeddings(make_provider, aux_module, waiter):
             "SELECT COUNT(*) FROM fact_embeddings"
         ).fetchone()[0] == 3
     )
+
+
+def test_shutdown_interrupted_extraction_stays_pending(make_provider, aux_module):
+    """A teardown that interrupts an in-flight extraction must not burn a retry.
+
+    When the gateway restarts mid-extraction the DB connection is torn down
+    under the worker, surfacing as a bad file descriptor. That is not a real
+    extraction failure: the row must be left pending with its attempt count
+    untouched so the next worker drains it cleanly, instead of consuming a
+    retry attempt and logging an error on every restart.
+    """
+    import threading
+
+    provider = make_provider(init=False, **_extraction_cfg())
+    provider.initialize("test-session")
+    # Quiesce the auto-started worker so only our controlled drain runs.
+    provider._queue_stop.set()
+    if provider._queue_worker:
+        provider._queue_worker.join(timeout=2.0)
+
+    stop = threading.Event()
+
+    def fail_as_if_shutting_down(**kwargs):
+        # Simulate teardown landing mid-extraction: stop is set, then the
+        # connection-backed call blows up with a bad file descriptor.
+        stop.set()
+        raise OSError(9, "Bad file descriptor")
+
+    aux_module.call_llm = fail_as_if_shutting_down
+
+    row_id = provider._extract_queue.enqueue("USER: transcript cut off by a restart")
+    provider._drain_extract_queue(stop, provider._extract_queue)
+
+    row = provider._extract_queue._conn.execute(
+        "SELECT status, attempts FROM extract_queue WHERE id = ?", (row_id,)
+    ).fetchone()
+    assert row[0] == "pending", "shutdown-interrupted row must stay pending"
+    assert row[1] == 0, "a shutdown interruption must not consume a retry attempt"
+    assert provider._extract_queue.dead_count() == 0

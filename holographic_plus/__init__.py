@@ -13,7 +13,11 @@ Config (same ``plugins.hermes-memory-store`` block, extra keys):
         embedding_weight: 0.3            # weight for embedding similarity (default 0.3)
         embedding_backend: fastembed     # "fastembed" (local CPU, default) or "ollama"
         fastembed_model: BAAI/bge-base-en-v1.5
+        embedding_prefix_policy: none    # "none" (default) or "auto" (apply the model's query/passage prefixes)
+        hrr_weight: 0.2                  # set 0 to disable the HRR signal (fts/jaccard/hrr rescale to sum 1.0)
         embed_on_add: true               # embed immediately when a fact is added (default true)
+        dedup_on_add: true               # skip near-verbatim restatements on add (default true)
+        dedup_jaccard: 0.9               # word-overlap needed to call it a duplicate (same values required)
         # extraction_provider / extraction_model: default to the host agent's model
 
 Retrieval weights:
@@ -43,6 +47,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -51,6 +56,71 @@ from typing import Any, Dict, List, Optional
 
 from plugins.memory.holographic import HolographicMemoryProvider
 from .embeddings import FastEmbedder, OllamaEmbedder
+
+
+# --- Near-duplicate detection (write-time dedup guard) -----------------------
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _norm_tokens(text: str) -> set:
+    """Lowercased alphanumeric token set."""
+    return set(_WORD_RE.findall((text or "").lower()))
+
+
+def _value_tokens(text: str) -> set:
+    """Tokens carrying a concrete value (numbers, ports, SHAs, ids, versions).
+
+    A changed value means an UPDATE, not a duplicate, so these must match for a
+    write to be treated as a near-duplicate and skipped.
+    """
+    return {t for t in _norm_tokens(text) if any(c.isdigit() for c in t)}
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+_STOPWORDS = frozenset(
+    "a an the is are was were be been being am of to in on at for and or with by "
+    "as it its this that these those from into over under has have had do does did "
+    "will would can could should may might must not no".split()
+)
+
+
+def _content_tokens(text: str) -> set:
+    """Significant (non-function) words."""
+    return _norm_tokens(text) - _STOPWORDS
+
+
+def _is_near_duplicate(content: str, other: str, threshold: float) -> bool:
+    """True only if *content* is a near-identical RESTATEMENT of *other*: the same
+    concrete values AND the same content words (ignoring function words and word
+    order), with token Jaccard >= *threshold* as a fast pre-filter.
+
+    Deliberately conservative: any differing content word (active->archived,
+    enabled->disabled, joining->declining) or any differing value means a possible
+    UPDATE, so the fact is KEPT, never skipped. Reworded-but-equivalent duplicates
+    are left to the value-aware, reviewable consolidation pass, not dropped here.
+    """
+    if _value_tokens(content) != _value_tokens(other):
+        return False
+    if _jaccard(_norm_tokens(content), _norm_tokens(other)) < threshold:
+        return False
+    return _content_tokens(content) == _content_tokens(other)
+
+
+_SUPERSEDED_PREFIXES = ("superseded", "stale/disabled", "historical/superseded")
+
+
+def _is_superseded(content: str) -> bool:
+    """True if *content* is explicitly marked as a retired/superseded fact, so
+    retrieval can exclude it. Demote-not-delete only helps if reads skip these;
+    trust demotion alone proved unreliable (markers landed at/above the floor)."""
+    return (content or "").lstrip().lower().startswith(_SUPERSEDED_PREFIXES)
+
+
 from .embed_store import EmbedStore
 from .extract_queue import ExtractQueue, is_quota_error, quota_retry_delay
 from .llm_extract import _format_conversation, extract_facts_from_transcript, insert_facts
@@ -65,21 +135,72 @@ _HRR_W     = 0.2
 _EMBED_W   = 0.3
 
 
-def _blend_score(holo_score: float, raw_emb_sim: Optional[float], trust: float, ew: float) -> float:
+# Per-model instruction prefixes, applied when embedding_prefix_policy="auto".
+# Matched by case-insensitive substring on the embedding model name, so versioned
+# ids resolve (e.g. "BAAI/bge-large-en-v1.5"). Each entry is
+# (model_key, query_prefix, document_prefix) from the model's documented
+# retrieval usage. Order matters: specific keys first, the broad "e5" key last.
+# Models with no known prefix (e.g. bge-m3) fall through and embed verbatim.
+_MODEL_PREFIXES = (
+    ("embeddinggemma", "task: search result | query: ", "title: none | text: "),
+    ("qwen3-embedding",
+     "Instruct: Given a search query, retrieve relevant passages that answer the query\nQuery: ",
+     ""),
+    ("nomic-embed", "search_query: ", "search_document: "),
+    ("arctic-embed2", "query: ", ""),
+    ("arctic-embed", "Represent this sentence for searching relevant passages: ", ""),
+    ("mxbai-embed", "Represent this sentence for searching relevant passages: ", ""),
+    ("bge-large", "Represent this sentence for searching relevant passages: ", ""),
+    ("bge-base", "Represent this sentence for searching relevant passages: ", ""),
+    ("bge-small", "Represent this sentence for searching relevant passages: ", ""),
+    ("e5", "query: ", "passage: "),
+)
+
+
+def _registry_prefix(model: str, role: str) -> str:
+    """Return the documented query/document prefix for *model*, or "" if unknown."""
+    m = (model or "").lower()
+    for key, qpfx, dpfx in _MODEL_PREFIXES:
+        if key in m:
+            return qpfx if role == "query" else dpfx
+    return ""
+
+
+def _blend_score(holo_score: float, raw_emb_sim: Optional[float], ew: float) -> float:
     """Combine the holographic score and the dense-embedding similarity on one scale.
 
     ``holo_score`` is the parent's relevance × trust (range ``[0, trust]``), with the
-    parent's FTS/Jaccard/HRR weights rescaled to sum to 1.0. The holographic signals
-    share a ``(1 - ew)`` slice of the budget and the embedding gets ``ew``. The cosine
-    similarity is mapped ``[-1, 1] → [0, 1]`` and likewise trust-weighted, so both
-    terms live in ``[0, trust]`` and the weights genuinely partition the budget. A
-    fact with no embedding simply cannot earn the ``ew`` slice.
+    parent's FTS/Jaccard/HRR weights rescaled to sum to 1.0, and it carries the trust
+    signal. It gets a ``(1 - ew)`` slice; the dense cosine gets ``ew``. The cosine is
+    mapped ``[-1, 1] → [0, 1]`` and is deliberately NOT trust-weighted: multiplying it
+    by trust let high-trust distractors outrank the correct default-trust fact and
+    measured ~23 points lower recall@1, so trust influences ranking only via the
+    holographic term. A fact with no embedding cannot earn the ``ew`` slice.
     """
     base = (1.0 - ew) * holo_score
     if raw_emb_sim is None:
         return base
     emb_norm = (raw_emb_sim + 1.0) / 2.0  # cosine [-1,1] → [0,1]
-    return base + ew * emb_norm * trust
+    return base + ew * emb_norm
+
+
+def _cfg_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _cfg_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class HolographicPlusProvider(HolographicMemoryProvider):
@@ -90,12 +211,36 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         cfg = self._config
         self._embed_weight: float = float(cfg.get("embedding_weight", _EMBED_W))
         self._embedding_backend: str = str(cfg.get("embedding_backend", "fastembed")).lower()
-        self._embedding_prefix_policy: str = str(cfg.get("embedding_prefix_policy", "none"))
+        self._embedding_prefix_policy: str = str(cfg.get("embedding_prefix_policy", "none")).lower()
+        # Explicit prefix overrides win over the per-model registry when the
+        # policy is not "none"; either may be set on its own.
+        self._embedding_query_prefix: Optional[str] = cfg.get("embedding_query_prefix")
+        self._embedding_document_prefix: Optional[str] = cfg.get("embedding_document_prefix")
         self._ollama_url: str     = str(cfg.get("ollama_url", "http://localhost:11434"))
         self._ollama_model: str   = str(cfg.get("ollama_model", "qwen3-embedding:8b"))
         self._fastembed_model: str = str(cfg.get("fastembed_model", "BAAI/bge-base-en-v1.5"))
         self._fastembed_cache_dir: Optional[str] = cfg.get("fastembed_cache_dir")
         self._embed_on_add: bool  = bool(cfg.get("embed_on_add", True))
+        # Write-time dedup: skip a new fact that merely restates an existing one
+        # (heavy word overlap AND identical concrete values, so updates are kept).
+        self._dedup_on_add: bool   = bool(cfg.get("dedup_on_add", True))
+        self._dedup_jaccard: float = float(cfg.get("dedup_jaccard", 0.9))
+
+        # Optional final-stage retrieval decision gates. Disabled by default so
+        # existing installs preserve current recall until a MemoryArena-calibrated
+        # rule is explicitly enabled in config.
+        self._retrieval_decision_enabled: bool = _cfg_bool(
+            cfg.get("retrieval_decision_enabled"), False
+        )
+        self._retrieval_decision_min_score: Optional[float] = _cfg_float(
+            cfg.get("retrieval_decision_min_score")
+        )
+        self._retrieval_decision_min_margin: Optional[float] = _cfg_float(
+            cfg.get("retrieval_decision_min_margin")
+        )
+        self._retrieval_decision_min_trust: Optional[float] = _cfg_float(
+            cfg.get("retrieval_decision_min_trust")
+        )
 
         # Fact-extraction LLM: explicit override, else the host agent's own model,
         # else disabled. Never hardcodes a provider: works with whatever the user runs.
@@ -153,6 +298,28 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             model=self._ollama_model,
         )
 
+    def _prefix_for(self, role: str) -> str:
+        """Resolve the instruction prefix for *role* ("query" or "document").
+
+        Policy "none" (default) applies nothing. Otherwise an explicit config
+        override wins, falling back to the per-model registry under "auto".
+        """
+        policy = getattr(self, "_embedding_prefix_policy", "none")
+        if policy == "none":
+            return ""
+        if role == "query" and self._embedding_query_prefix is not None:
+            return self._embedding_query_prefix
+        if role == "document" and self._embedding_document_prefix is not None:
+            return self._embedding_document_prefix
+        if policy == "auto":
+            return _registry_prefix(self._embedding_model_name(), role)
+        return ""
+
+    def _embed_text(self, text: str, role: str) -> str:
+        """Prepend the role-appropriate instruction prefix (if any) to *text*."""
+        prefix = self._prefix_for(role)
+        return f"{prefix}{text}" if prefix else text
+
     # ------------------------------------------------------------------
     # MemoryProvider identity
     # ------------------------------------------------------------------
@@ -198,10 +365,19 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         hrr_dim = int(self._config.get("hrr_dim", 1024))
         temporal_decay = int(self._config.get("temporal_decay_half_life", 0))
 
-        holo_sum  = _FTS_W + _JACCARD_W + _HRR_W
-        fts_w     = _FTS_W / holo_sum
-        jaccard_w = _JACCARD_W / holo_sum
-        hrr_w     = _HRR_W / holo_sum
+        # Holographic signal weights are config-overridable so the HRR signal can
+        # be down-weighted or disabled (hrr_weight: 0). Whatever the raw values,
+        # they are rescaled to sum to 1.0 so the (1-ew)/ew blend budget holds.
+        fts_cfg = float(self._config.get("fts_weight", _FTS_W))
+        jac_cfg = float(self._config.get("jaccard_weight", _JACCARD_W))
+        hrr_cfg = float(self._config.get("hrr_weight", _HRR_W))
+        holo_sum = fts_cfg + jac_cfg + hrr_cfg
+        if holo_sum <= 0:
+            fts_cfg, jac_cfg, hrr_cfg = _FTS_W, _JACCARD_W, _HRR_W
+            holo_sum = _FTS_W + _JACCARD_W + _HRR_W
+        fts_w     = fts_cfg / holo_sum
+        jaccard_w = jac_cfg / holo_sum
+        hrr_w     = hrr_cfg / holo_sum
 
         self._retriever = PlusFactRetriever(
             store=self._store,
@@ -499,6 +675,19 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                         row["id"], inserted,
                     )
             except Exception as exc:
+                if stop.is_set():
+                    # Interrupted by shutdown/teardown: the DB connection is
+                    # being closed under the worker (surfaces as a bad file
+                    # descriptor). This is not a genuine extraction failure, so
+                    # leave the row pending with its attempt count untouched and
+                    # exit. The next worker drains it cleanly on startup, instead
+                    # of burning a retry attempt and logging an error on every
+                    # gateway restart.
+                    logger.debug(
+                        "holographic_plus: extraction interrupted by shutdown; "
+                        "leaving queue item %s pending", row["id"],
+                    )
+                    break
                 err = str(exc)
                 if is_quota_error(err):
                     # Plan-limit windows reset on the provider's schedule, not
@@ -675,7 +864,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             return
 
         try:
-            if action == "add" and self._embed_on_add:
+            if action == "add" and self._embed_on_add and result.get("status") == "added":
                 fact_id = result.get("fact_id")
                 if fact_id and self._embedder_available and self._embed_store:
                     content = args.get("content", "")
@@ -746,6 +935,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         category: str | None = None,
         min_trust: float = 0.3,
         limit: int = 10,
+        bump: bool = True,
     ) -> List[Dict[str, Any]]:
         """Hybrid search: holographic pipeline + embedding similarity.
 
@@ -761,26 +951,33 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             min_trust=min_trust,
             limit=limit * 3,
         )
+        # Exclude explicitly-superseded facts from retrieval (demote-not-delete
+        # only works if reads skip them; trust demotion alone proved unreliable).
+        holo_results = [r for r in holo_results if not _is_superseded(r.get("content", ""))]
 
         if not self._embedder_available or not self._embed_store or not self._embedder:
             # Pure holographic fallback
-            for r in holo_results[:limit]:
+            selected = self._apply_retrieval_decision(holo_results)[:limit]
+            for r in selected:
                 r["embedding_score"] = None
-            self._bump_retrieval_counts(holo_results[:limit])
-            return holo_results[:limit]
+            if bump:
+                self._bump_retrieval_counts(selected)
+            return selected
 
         # --- Step 2: embed query + score all facts
         try:
-            query_vec = self._embedder.embed(query)
+            query_vec = self._embedder.embed(self._embed_text(query, "query"))
         except Exception as exc:
             logger.debug("holographic_plus: query embed failed: %s", exc)
             query_vec = None
 
         if query_vec is None:
-            for r in holo_results[:limit]:
+            selected = self._apply_retrieval_decision(holo_results)[:limit]
+            for r in selected:
                 r["embedding_score"] = None
-            self._bump_retrieval_counts(holo_results[:limit])
-            return holo_results[:limit]
+            if bump:
+                self._bump_retrieval_counts(selected)
+            return selected
 
         # Get all embedding scores as a dict
         try:
@@ -831,6 +1028,8 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 ).fetchall()
             for row in rows:
                 d = dict(row)
+                if _is_superseded(d.get("content", "")):
+                    continue
                 d["score"] = 0.0  # no holographic score
                 extra_facts.append(d)
 
@@ -839,15 +1038,23 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         for fact in all_candidates:
             fid = fact["fact_id"]
             holo_score = fact.get("score", 0.0)  # parent relevance × trust, in [0, trust]
-            trust = float(fact.get("trust_score", fact.get("trust", 0.0)) or 0.0)
             raw_emb_sim = emb_scores.get(fid)
 
-            fact["score"] = _blend_score(holo_score, raw_emb_sim, trust, ew)
+            fact["score"] = _blend_score(holo_score, raw_emb_sim, ew)
             fact["embedding_score"] = round(raw_emb_sim, 4) if raw_emb_sim is not None else None
 
             merged.append(fact)
 
-        merged.sort(key=lambda x: x["score"], reverse=True)
+        # Primary key: blended relevance. Tie-break: more-recent first, so recency
+        # only decides exact score ties and never displaces a clearly better match
+        # (normalize the mixed "YYYY-MM-DD HH:MM" / "...THH:MM" timestamp formats).
+        merged.sort(
+            key=lambda x: (
+                x["score"],
+                (x.get("updated_at") or x.get("created_at") or "").replace(" ", "T"),
+            ),
+            reverse=True,
+        )
         # Deduplicate by fact_id (extra_ids might overlap holo)
         seen: set = set()
         unique: List[Dict[str, Any]] = []
@@ -856,8 +1063,51 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 seen.add(f["fact_id"])
                 unique.append(f)
 
-        self._bump_retrieval_counts(unique[:limit])
-        return unique[:limit]
+        selected = self._apply_retrieval_decision(unique)[:limit]
+        if bump:
+            self._bump_retrieval_counts(selected)
+        return selected
+
+    def _apply_retrieval_decision(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Apply optional final-stage confidence gates to ranked search results.
+
+        This is the production hook for MemoryArena-calibrated abstention: keep
+        ranking untouched when disabled; otherwise remove low-confidence rows
+        and, when configured, abstain from the whole query if the top two scores
+        are too close to distinguish. Callers pass rows sorted by descending score.
+        """
+        if not self._retrieval_decision_enabled or not results:
+            return results
+
+        filtered: List[Dict[str, Any]] = []
+        for row in results:
+            if _is_superseded(row.get("content", "")):
+                continue
+            if self._retrieval_decision_min_score is not None:
+                try:
+                    score = float(row.get("score", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if score < self._retrieval_decision_min_score:
+                    continue
+            if self._retrieval_decision_min_trust is not None:
+                try:
+                    trust = float(row.get("trust_score", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if trust < self._retrieval_decision_min_trust:
+                    continue
+            filtered.append(row)
+
+        min_margin = self._retrieval_decision_min_margin
+        if min_margin is not None and len(filtered) > 1:
+            try:
+                margin = float(filtered[0].get("score", 0.0)) - float(filtered[1].get("score", 0.0))
+            except (TypeError, ValueError):
+                margin = None
+            if margin is not None and margin < min_margin:
+                return []
+        return filtered
 
     def _bump_retrieval_counts(self, results: List[Dict[str, Any]]) -> None:
         """Increment facts.retrieval_count for the returned facts (parent-store idiom).
@@ -900,8 +1150,51 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             except Exception as exc:
                 return _json.dumps({"error": str(exc)})
 
+        if action == "add" and self._dedup_on_add:
+            dup = self._find_near_duplicate(
+                (args.get("content") or "").strip(),
+                category=args.get("category"),
+            )
+            if dup is not None:
+                return _json.dumps({
+                    "fact_id": dup.get("fact_id"),
+                    "status": "deduped",
+                    "note": (
+                        f"near-duplicate of existing fact {dup.get('fact_id')}; "
+                        "not stored again"
+                    ),
+                })
+
         # For all other actions delegate to parent
         return super()._handle_fact_store(args)
+
+    def _find_near_duplicate(
+        self, content: str, category: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Return an existing active fact that *content* merely restates, else None.
+
+        Uses the hybrid search to fetch the closest existing facts, then keeps
+        only a match that overlaps heavily in wording (token Jaccard >=
+        ``self._dedup_jaccard``) AND carries the same concrete values, so an
+        updated value is never skipped. Degrades to None (normal add) on error.
+        """
+        if not content:
+            return None
+        try:
+            results = self.search(
+                content,
+                category=category,
+                min_trust=self._min_trust,
+                limit=3,
+                bump=False,
+            )
+        except Exception as exc:
+            logger.debug("holographic_plus: dedup search failed: %s", exc)
+            return None
+        for r in results:
+            if _is_near_duplicate(content, r.get("content", ""), self._dedup_jaccard):
+                return r
+        return None
 
     # ------------------------------------------------------------------
     # Maintenance: rebuild_embeddings
@@ -939,7 +1232,9 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             batch = rows[i:i + batch_size]
             contents = [row["content"] for row in batch]
             try:
-                vecs = self._embedder.embed_batch(contents)
+                vecs = self._embedder.embed_batch(
+                    [self._embed_text(c, "document") for c in contents]
+                )
             except Exception as exc:
                 logger.debug("rebuild_embeddings: batch embed failed at %d: %s", i, exc)
                 skipped += len(batch)
@@ -1045,7 +1340,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         try:
             if not self._embedder or not self._embed_store:
                 return
-            vec = self._embedder.embed(content)
+            vec = self._embedder.embed(self._embed_text(content, "document"))
             if vec is not None:
                 self._embed_store.upsert(
                     fact_id,
@@ -1108,7 +1403,9 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 chunk = pending[i:i + _BATCH]
                 contents = [c for _, c in chunk]
                 try:
-                    vecs = self._embedder.embed_batch(contents)
+                    vecs = self._embedder.embed_batch(
+                        [self._embed_text(c, "document") for c in contents]
+                    )
                 except Exception as exc:
                     logger.debug("holographic_plus backfill: batch embed failed: %s", exc)
                     continue
