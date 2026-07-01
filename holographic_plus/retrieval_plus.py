@@ -21,10 +21,30 @@ pay the blob read, and the candidate dicts never carry blobs around.
 
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional
 
 from plugins.memory.holographic import holographic as hrr
 from plugins.memory.holographic.retrieval import FactRetriever
+
+# Token boundary matching the FTS5 default (unicode61) tokenizer: it splits on
+# every non-alphanumeric character (including '_', '-', ':', '.', '/'), so a
+# literal like ``term_id`` is indexed as ``term`` + ``id`` and ``localhost:18791``
+# as ``localhost`` + ``18791``. Extracting tokens the same way lets us build a
+# MATCH string whose terms actually exist in the index.
+_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+
+# Natural-language filler that adds BM25 noise without identifying a fact. Kept
+# small and conservative: only words that are almost never the distinguishing
+# token of a stored fact. Dropped ONLY when at least one non-stopword survives.
+_FTS_STOPWORDS = frozenset(
+    """
+    a an and are as at be but by do does for from has have how i if in is it its
+    me my no not of on or our so that the their them then there these this to
+    was we were what when where which who whom whose why will with you your
+    about can could would should may might must shall into over under out up
+    """.split()
+)
 
 
 class PlusFactRetriever(FactRetriever):
@@ -109,6 +129,36 @@ class PlusFactRetriever(FactRetriever):
             return {}
         return {int(r["fact_id"]): r["hrr_vector"] for r in rows}
 
+    @staticmethod
+    def _fts_match_query(query: str) -> str:
+        """Build a safe FTS5 MATCH expression from a natural-language query.
+
+        The parent feeds the raw query straight into ``facts_fts MATCH ?``.
+        FTS5 then parses it as a query *expression*: a hyphen is the NOT
+        operator (``agent-deck`` -> ``agent NOT deck``), and ``:`` ``.`` ``/``
+        ``~`` ``'`` raise syntax errors, so almost every real query either
+        errors out (caught -> empty) or, with default AND semantics, requires
+        every token to co-occur in one short fact and matches nothing. Lexical
+        recall is effectively dead.
+
+        This extracts the index's own tokens, drops stopwords (only while a
+        content token survives), wraps each survivor in double quotes so no
+        character is treated as an operator, and ORs them. OR maximises recall;
+        BM25 ``rank`` ordering plus the downstream Jaccard/dense/trust rerank
+        restore precision. Returns ``""`` when nothing significant remains, so
+        the caller can skip the MATCH entirely.
+        """
+        if not query:
+            return ""
+        tokens = _FTS_TOKEN_RE.findall(query.lower())
+        if not tokens:
+            return ""
+        significant = [t for t in tokens if t not in _FTS_STOPWORDS]
+        # If the query was all stopwords, fall back to the raw tokens rather
+        # than returning nothing (better an over-broad match than no recall).
+        chosen = significant or tokens
+        return " OR ".join(f'"{t}"' for t in chosen)
+
     def _fts_candidates(
         self,
         query: str,
@@ -118,13 +168,19 @@ class PlusFactRetriever(FactRetriever):
     ) -> List[dict]:
         """Parent's FTS5 candidate fetch with explicit columns.
 
-        Identical filtering, ordering, and rank normalisation; the only
-        difference is that hrr_vector is not selected, so candidate rows do
-        not pull the blob through SQLite's overflow pages.
+        Same filtering, ordering, and rank normalisation as the parent, with
+        two differences: hrr_vector is not selected (so candidate rows do not
+        pull the blob through SQLite's overflow pages), and the raw query is
+        sanitised into a safe MATCH expression via ``_fts_match_query`` so
+        FTS5 operators/punctuation no longer silently kill lexical recall.
         """
         conn = self.store._conn
 
-        params: list = [query]
+        match_query = self._fts_match_query(query)
+        if not match_query:
+            return []
+
+        params: list = [match_query]
         where_clauses = ["facts_fts MATCH ?"]
 
         if category:

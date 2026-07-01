@@ -169,12 +169,33 @@ def real_store(real_parent, tmp_path):
     store.close()
 
 
-def _assert_bit_identical(parent, plus, query, category, min_trust):
+def _assert_parent_recall_superset(parent, plus, query, category, min_trust):
+    """Plus is a strict recall improvement over the parent, scores preserved.
+
+    The parent feeds the raw query to ``facts_fts MATCH``, which ANDs every
+    token (and errors out on hyphens/punctuation), so it silently misses facts
+    that contain only some query tokens -- the dead-lexical-recall bug.
+    PlusFactRetriever sanitises the query into an OR of the index's own tokens,
+    so for any query it returns a SUPERSET of the parent's facts. Where a fact
+    appears in BOTH result sets the score is byte-identical (==, not approx),
+    which keeps this an exact check of the hot-path scoring and the real
+    temporal-decay math on the shared facts. The hot-path no-blob invariant
+    still holds.
+    """
     expected = parent.search(query, category=category, min_trust=min_trust, limit=5)
     actual = plus.search(query, category=category, min_trust=min_trust, limit=5)
     label = f"query={query!r} category={category!r} min_trust={min_trust}"
-    assert [f["fact_id"] for f in actual] == [f["fact_id"] for f in expected], label
-    assert [f["score"] for f in actual] == [f["score"] for f in expected], label
+
+    exp_scores = {f["fact_id"]: f["score"] for f in expected}
+    act_scores = {f["fact_id"]: f["score"] for f in actual}
+
+    # Recall superset: every parent hit is also retrieved by Plus.
+    assert set(exp_scores).issubset(set(act_scores)), (
+        f"{label}: parent {sorted(exp_scores)} not subset of plus {sorted(act_scores)}"
+    )
+    # Scores byte-identical for facts present in both (exact, not approx).
+    for fid in set(exp_scores) & set(act_scores):
+        assert act_scores[fid] == exp_scores[fid], f"{label}: score drift on fact {fid}"
     for fact in actual:
         assert "hrr_vector" not in fact
     return bool(expected)
@@ -186,7 +207,7 @@ def test_plus_is_a_real_parent_subclass(real_parent, plus_real):
     assert plus_real.hrr is real_holo
 
 
-def test_bit_identical_ids_and_scores_without_decay(real_parent, plus_real, real_store):
+def test_parent_recall_superset_without_decay(real_parent, plus_real, real_store):
     _, retrieval_mod, _ = real_parent
     parent = retrieval_mod.FactRetriever(
         store=real_store, temporal_decay_half_life=0, **WEIGHTS
@@ -198,16 +219,16 @@ def test_bit_identical_ids_and_scores_without_decay(real_parent, plus_real, real
     for query in QUERIES:
         for category in CATEGORIES:
             for min_trust in TRUST_LEVELS:
-                matched += _assert_bit_identical(parent, plus, query, category, min_trust)
+                matched += _assert_parent_recall_superset(parent, plus, query, category, min_trust)
     assert matched >= 10, "too few non-empty result sets for a meaningful check"
 
 
-def test_bit_identical_with_real_temporal_decay(real_parent, plus_real, real_store, monkeypatch):
+def test_parent_recall_superset_with_real_temporal_decay(real_parent, plus_real, real_store, monkeypatch):
     """Temporal decay NOT hardwired: old created_at drives the real decay math.
 
     The real _temporal_decay reads datetime.now() per call, so the wall clock
     is frozen on the real retrieval module (which both retrievers share via
-    inheritance) to make bit-identical score comparison possible.
+    inheritance) so the shared-fact scores stay byte-identical for comparison.
     """
     _, retrieval_mod, _ = real_parent
 
@@ -238,5 +259,5 @@ def test_bit_identical_with_real_temporal_decay(real_parent, plus_real, real_sto
     for query in QUERIES:
         for category in CATEGORIES:
             for min_trust in TRUST_LEVELS:
-                matched += _assert_bit_identical(parent, plus, query, category, min_trust)
+                matched += _assert_parent_recall_superset(parent, plus, query, category, min_trust)
     assert matched >= 10, "too few non-empty result sets for a meaningful check"

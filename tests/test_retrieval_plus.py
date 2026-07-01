@@ -60,7 +60,14 @@ def test_parent_encodes_per_candidate_baseline(populated_store, monkeypatch):
     assert len(calls) > 1
 
 
-def test_results_match_parent_semantics_exactly(hp, populated_store):
+def test_single_token_queries_match_parent_exactly(hp, populated_store):
+    """Single-token queries: byte-identical to the parent.
+
+    With one token there is no AND-vs-OR difference (the parent's raw
+    ``facts_fts MATCH 'projects'`` and the sanitised ``MATCH '"projects"'``
+    select the same rows), so the hot-path optimisations must reproduce the
+    parent's ids and scores exactly.
+    """
     kwargs = dict(
         store=populated_store, hrr_dim=64,
         fts_weight=3 / 7, jaccard_weight=2 / 7, hrr_weight=2 / 7,
@@ -68,13 +75,52 @@ def test_results_match_parent_semantics_exactly(hp, populated_store):
     parent = fake_hermes.FactRetriever(**kwargs)
     plus = hp.retrieval_plus.PlusFactRetriever(**kwargs)
 
-    for query in ["projects", "sqlite store", "user", "node deploy"]:
+    for query in ["projects", "user", "sqlite", "node"]:
         expected = parent.search(query, min_trust=0.0, limit=5)
         actual = plus.search(query, min_trust=0.0, limit=5)
-        assert [f["fact_id"] for f in actual] == [f["fact_id"] for f in expected]
+        assert [f["fact_id"] for f in actual] == [f["fact_id"] for f in expected], query
         for a, e in zip(actual, expected):
             assert a["score"] == pytest.approx(e["score"])
             assert "hrr_vector" not in a
+
+
+def test_multi_token_recall_is_a_parent_superset(hp, populated_store):
+    """Multi-token queries: a strict recall improvement over the parent.
+
+    The parent feeds the raw query to FTS5, which ANDs every token, so a
+    fact must contain ALL tokens to be a candidate (and any hyphen/punctuation
+    silently errors the whole match out). The sanitiser ORs the significant
+    tokens, so PlusFactRetriever finds a SUPERSET of the parent's candidates:
+    every fact the parent returned is still present, plus additional genuine
+    lexical matches the parent's AND-semantics missed. The shared facts keep
+    the parent's relative order.
+    """
+    kwargs = dict(
+        store=populated_store, hrr_dim=64,
+        fts_weight=3 / 7, jaccard_weight=2 / 7, hrr_weight=2 / 7,
+    )
+    parent = fake_hermes.FactRetriever(**kwargs)
+    plus = hp.retrieval_plus.PlusFactRetriever(**kwargs)
+
+    saw_strict_superset = False
+    for query in ["sqlite store", "node deploy", "memory facts", "dark dashboards"]:
+        expected = parent.search(query, min_trust=0.0, limit=10)
+        actual = plus.search(query, min_trust=0.0, limit=10)
+        exp_ids = [f["fact_id"] for f in expected]
+        act_ids = [f["fact_id"] for f in actual]
+        # Superset: every parent hit is still retrieved.
+        assert set(exp_ids).issubset(set(act_ids)), f"{query}: {exp_ids} !subset {act_ids}"
+        # Shared facts keep the parent's relative order.
+        shared = [fid for fid in act_ids if fid in set(exp_ids)]
+        assert shared == exp_ids, f"{query}: shared order {shared} != parent {exp_ids}"
+        for a in actual:
+            assert "hrr_vector" not in a
+        if len(act_ids) > len(exp_ids):
+            saw_strict_superset = True
+    assert saw_strict_superset, (
+        "expected at least one query where the sanitised OR recovers facts the "
+        "parent's AND-semantics missed"
+    )
 
 
 def test_category_and_trust_filters_match_parent(hp, populated_store):
