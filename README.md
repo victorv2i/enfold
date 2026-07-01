@@ -46,6 +46,13 @@ plugins:
   hermes-memory-store:
     embedding_backend: fastembed            # "fastembed" (local CPU, default) or "ollama"
     embedding_weight: 0.3                   # weight of dense similarity in the hybrid score
+    embedding_prefix_policy: none           # "none" (default) or "auto": apply the model's documented query/passage prefixes
+    # fts_weight / jaccard_weight / hrr_weight default 0.3 / 0.2 / 0.2 and are
+    # rescaled to sum to 1.0; set hrr_weight: 0 to disable the HRR signal.
+    retrieval_decision_enabled: false       # optional calibrated final-stage filter/abstention gates
+    # retrieval_decision_min_score: 0.5      # drop candidates below this final score when enabled
+    # retrieval_decision_min_margin: 0.02    # abstain when top-2 filtered scores are too close
+    # retrieval_decision_min_trust: 0.5      # drop candidates below this trust when enabled
     embed_on_add: true                      # embed a fact immediately when it is added
     fastembed_model: BAAI/bge-base-en-v1.5  # 768-dim, local
     ollama_url: http://localhost:11434      # only if embedding_backend: ollama
@@ -59,6 +66,44 @@ plugins:
 ```
 
 Embeddings are **identity-versioned** (`backend:model:role:vN`), so switching models never corrupts existing vectors: each model's vectors live under their own identity, and the new model's are backfilled in the background. On startup, any fact missing a current-identity embedding is backfilled in a non-blocking background thread (in batches), and the worker re-runs the backfill periodically so transient embedding failures heal on their own. Vectors from a superseded model are kept until you reclaim them: call `provider.vacuum_embeddings()` to drop them without re-embedding, or `rebuild_embeddings()`, which prunes them after re-embedding.
+
+## Recommended configuration
+
+A reproducible recall benchmark (`tests/eval.py` for the dense layer, plus an
+end-to-end provider sweep over a 120-fact / 72-query set with hard distractor
+clusters) gives a clear picture for a single-user self-hosted store:
+
+- The dense embedding model is the dominant lever. The embedding weight and the
+  HRR signal do not move recall on semantic / paraphrase queries, where keyword
+  search has little to grip; the large per-fact HRR vector is effectively dead
+  weight there.
+- A final-stage cross-encoder reranker did not help on short atomic facts paired
+  with a strong embedder; it regressed recall, so it is not recommended here.
+
+End-to-end recall@1 / MRR through the provider:
+
+```
+bge-large, no prefix, HRR on (typical default)   r@1 0.69   MRR 0.79
+bge-large, +prefix, HRR on                        r@1 0.78   MRR 0.85
+embeddinggemma, +prefix, HRR off                  r@1 0.90   MRR 0.94
+```
+
+Recommended (GPU via Ollama):
+
+```yaml
+plugins:
+  hermes-memory-store:
+    embedding_backend: ollama
+    ollama_model: embeddinggemma            # 768-dim, Apache-2.0
+    embedding_prefix_policy: auto
+    hrr_weight: 0                           # HRR adds no measured recall here; frees storage
+```
+
+CPU-only alternative: `embedding_backend: fastembed`,
+`fastembed_model: snowflake/snowflake-arctic-embed-l`, `embedding_prefix_policy: auto`.
+
+These numbers are from one synthetic set, so treat small gaps as noise and re-run
+`tests/eval.py` on your own data before committing to a change.
 
 ## Tools
 
@@ -112,6 +157,25 @@ The dense-embedding retrieval, LLM fact extraction, and hybrid scoring are this 
 MIT, see [LICENSE](LICENSE).
 
 ## Release notes
+
+### 0.5.1
+
+- Graceful extraction-queue shutdown: when the gateway restarts mid-extraction,
+  the in-flight row is now left pending with its attempt count untouched instead
+  of burning a retry and logging a "bad file descriptor" error. The next worker
+  drains it cleanly on startup. Fixes the recurring restart-time warning.
+
+### 0.5.0
+
+- Instruction-prefix support: `embedding_prefix_policy: auto` applies each model's
+  documented query/passage prefixes (bge, e5, nomic, arctic, embeddinggemma,
+  qwen3), with optional `embedding_query_prefix` / `embedding_document_prefix`
+  overrides. The policy is part of the embedding identity, so switching it
+  re-embeds in the background and never corrupts existing vectors.
+- Configurable holographic weights: `fts_weight` / `jaccard_weight` /
+  `hrr_weight`, rescaled to sum to 1.0. Set `hrr_weight: 0` to disable the HRR
+  signal, which the benchmark shows contributes no recall on semantic queries.
+- Added a benchmark-backed recommended configuration (see above).
 
 ### 0.4.0
 
