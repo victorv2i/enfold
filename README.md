@@ -1,8 +1,20 @@
-# Enfold
+<p align="center">
+  <img src="assets/logo.png" alt="Enfold logo: folded planes of light converging on a single bright point" width="280">
+</p>
 
-Enfold. Every memory enfolds the whole. A hybrid long-term memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+<h1 align="center">Enfold</h1>
 
-It extends the bundled **holographic** (HRR) fact store with **dense semantic embeddings** and **LLM-based fact extraction**, then merges every signal in a single hybrid retrieval pass, so the agent recalls facts by *meaning*, not just keyword overlap, while keeping the holographic store's symbolic strengths.
+<p align="center"><em>Every memory enfolds the whole.</em></p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/hermes--agent-memory%20plugin-8A2BE2" alt="Hermes Agent memory plugin">
+  <img src="https://img.shields.io/badge/MCP-stdio%20server-1f6feb" alt="MCP stdio server">
+</p>
+
+Enfold is a hybrid long-term memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent), with an MCP server that shares the same memory with Claude Code, Codex CLI, or any MCP-capable agent. One local SQLite brain, every agent recalls the same facts.
+
+It extends the bundled **holographic** (HRR) fact store with **dense semantic embeddings** and **LLM-based fact extraction**, then merges every signal in a single hybrid retrieval pass, so the agent recalls facts by *meaning*, not just keyword overlap, while keeping the holographic store's symbolic strengths. In a hologram, every fragment of the plate reconstructs the whole scene; Enfold treats memory the same way, so a partial cue is enough to bring back full context.
 
 It does not replace the holographic provider, it subclasses it. All the holographic foundation (the SQLite fact store, FTS search, trust scoring, entity resolution, and HRR compositional retrieval) is dusterbloom's work; this plugin adds a layer on top. See [NOTICE](NOTICE).
 
