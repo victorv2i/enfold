@@ -48,6 +48,8 @@ from .llm_extract import _extract_json_array
 
 logger = logging.getLogger(__name__)
 
+_SUPERSEDED_PREFIXES = ("superseded", "stale/disabled", "historical/superseded")
+
 
 # ── Schema: durable min-interval clock ──────────────────────────────────────
 
@@ -96,12 +98,41 @@ def set_last_run_at(conn: sqlite3.Connection, epoch: float) -> None:
 
 # ── Cluster selection ────────────────────────────────────────────────────────
 
+def _is_legacy_superseded(content: str) -> bool:
+    return (content or "").lstrip().lower().startswith(_SUPERSEDED_PREFIXES)
+
+
 def _active_fact_rows(conn: sqlite3.Connection) -> Dict[int, Dict[str, Any]]:
-    """All currently-valid facts as ``{fact_id: {content, category}}``."""
+    """All currently-valid source facts as ``{fact_id: {content, category}}``."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(facts)").fetchall()}
     where = " WHERE invalid_at IS NULL" if "invalid_at" in cols else ""
     rows = conn.execute(f"SELECT fact_id, content, category FROM facts{where}").fetchall()
-    return {int(r["fact_id"]): dict(r) for r in rows}
+    return {
+        int(r["fact_id"]): dict(r)
+        for r in rows
+        if r["category"] != "insight" and not _is_legacy_superseded(r["content"])
+    }
+
+
+def _sources_still_active(conn: sqlite3.Connection, source_ids: List[int]) -> bool:
+    if not source_ids:
+        return False
+    placeholders = ",".join("?" * len(source_ids))
+    rows = conn.execute(
+        f"SELECT fact_id, content, category, invalid_at FROM facts "
+        f"WHERE fact_id IN ({placeholders})",
+        source_ids,
+    ).fetchall()
+    if len(rows) != len(set(source_ids)):
+        return False
+    for row in rows:
+        if row["invalid_at"] is not None:
+            return False
+        if row["category"] == "insight":
+            return False
+        if _is_legacy_superseded(row["content"]):
+            return False
+    return True
 
 
 def _entity_clusters(
@@ -496,6 +527,14 @@ def run_reflection(
         content = result["insight"]
         source_ids = sorted(result["source_fact_ids"])
         tags = "source_facts:" + ",".join(str(i) for i in source_ids)
+
+        with lock:
+            if not _sources_still_active(conn, source_ids):
+                logger.debug(
+                    "reflection: skipped insight with stale source facts %s",
+                    source_ids,
+                )
+                continue
 
         if dedup_check is not None:
             try:

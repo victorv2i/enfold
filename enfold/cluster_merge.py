@@ -40,6 +40,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .embed_store import EmbedStore
 
+_SUPERSEDED_PREFIXES = ("superseded", "stale/disabled", "historical/superseded")
+
 
 class GuardRailError(Exception):
     """Raised when execute_merge refuses to run for safety reasons."""
@@ -83,7 +85,17 @@ def build_clusters(
     fact_ids_arr, matrix = embed_store._embedding_matrix(
         _dim(conn, embedding_identity), embedding_identity=embedding_identity
     )
-    fact_ids = fact_ids_arr.astype(int).tolist()
+    active_ids = _active_fact_ids(conn)
+    fact_ids = [
+        fid for fid in fact_ids_arr.astype(int).tolist()
+        if fid in active_ids
+    ]
+    if len(fact_ids) != len(fact_ids_arr):
+        keep = [
+            i for i, fid in enumerate(fact_ids_arr.astype(int).tolist())
+            if fid in active_ids
+        ]
+        matrix = matrix[keep]
     if len(fact_ids) < 2:
         return []
 
@@ -115,15 +127,38 @@ def _dim(conn: sqlite3.Connection, embedding_identity: Optional[str]) -> int:
     return int(row[0])
 
 
+def _is_legacy_superseded(content: str) -> bool:
+    return (content or "").lstrip().lower().startswith(_SUPERSEDED_PREFIXES)
+
+
+def _fact_table_cols(conn: sqlite3.Connection) -> set:
+    return {row[1] for row in conn.execute("PRAGMA table_info(facts)").fetchall()}
+
+
+def _active_fact_ids(conn: sqlite3.Connection) -> set:
+    cols = _fact_table_cols(conn)
+    where = " WHERE invalid_at IS NULL" if "invalid_at" in cols else ""
+    rows = conn.execute(f"SELECT fact_id, content FROM facts{where}").fetchall()
+    return {
+        int(row["fact_id"])
+        for row in rows
+        if not _is_legacy_superseded(row["content"])
+    }
+
+
 # ---------------------------------------------------------------------------
 # Survivor selection
 # ---------------------------------------------------------------------------
 
 def _fact_rows(conn: sqlite3.Connection, fact_ids: Sequence[int]) -> Dict[int, sqlite3.Row]:
     placeholders = ",".join("?" * len(fact_ids))
+    invalid_at_select = (
+        "invalid_at" if "invalid_at" in _fact_table_cols(conn) else "NULL AS invalid_at"
+    )
     rows = conn.execute(
         f"SELECT fact_id, content, tags, trust_score, retrieval_count, "
-        f"helpful_count, created_at FROM facts WHERE fact_id IN ({placeholders})",
+        f"helpful_count, created_at, {invalid_at_select} "
+        f"FROM facts WHERE fact_id IN ({placeholders})",
         list(fact_ids),
     ).fetchall()
     return {int(r["fact_id"]): r for r in rows}
@@ -139,6 +174,14 @@ def choose_survivor(
     See module docstring for the selection rule.
     """
     rows = _fact_rows(conn, fact_ids)
+    active_ids = [
+        fid for fid in fact_ids
+        if rows[fid]["invalid_at"] is None
+        and not _is_legacy_superseded(rows[fid]["content"])
+    ]
+    if active_ids:
+        fact_ids = active_ids
+
     pre_existing = [fid for fid in fact_ids if rows[fid]["created_at"] < flood_cutoff]
     flood = [fid for fid in fact_ids if rows[fid]["created_at"] >= flood_cutoff]
 

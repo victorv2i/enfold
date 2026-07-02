@@ -32,6 +32,7 @@ CREATE TABLE facts (
     helpful_count   INTEGER DEFAULT 0,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    invalid_at      TIMESTAMP,
     hrr_vector      BLOB
 );
 CREATE TABLE fact_entities (
@@ -66,11 +67,21 @@ def _conn():
 
 
 def _add_fact(conn, content, created_at, trust=0.5, retrieval=0, helpful=0,
-              tags="", category="general"):
+              tags="", category="general", invalid_at=None):
     cur = conn.execute(
         "INSERT INTO facts (content, category, tags, trust_score, retrieval_count, "
-        "helpful_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (content, category, tags, trust, retrieval, helpful, created_at, created_at),
+        "helpful_count, created_at, updated_at, invalid_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            content,
+            category,
+            tags,
+            trust,
+            retrieval,
+            helpful,
+            created_at,
+            created_at,
+            invalid_at,
+        ),
     )
     conn.commit()
     return int(cur.lastrowid)
@@ -124,6 +135,27 @@ def test_build_clusters_ignores_singletons():
     assert build_clusters(conn, threshold=0.92, embedding_identity=_ID) == []
 
 
+def test_build_clusters_excludes_structurally_invalid_and_legacy_superseded_facts():
+    conn = _conn()
+    active = _add_fact(conn, "current routing fact", "2026-06-01 00:00:00")
+    invalid = _add_fact(
+        conn,
+        "old routing fact",
+        "2026-05-01 00:00:00",
+        invalid_at="2026-06-02 00:00:00",
+    )
+    legacy = _add_fact(
+        conn,
+        "SUPERSEDED 2026-06-02: older routing fact",
+        "2026-04-01 00:00:00",
+    )
+    _embed(conn, active, _vec(1.0, 0.0))
+    _embed(conn, invalid, _vec(0.999, 0.001))
+    _embed(conn, legacy, _vec(0.999, 0.002))
+
+    assert build_clusters(conn, threshold=0.92, embedding_identity=_ID) == []
+
+
 # ---------------------------------------------------------------------------
 # choose_survivor
 # ---------------------------------------------------------------------------
@@ -158,6 +190,36 @@ def test_choose_survivor_all_pre_existing_picks_by_trust_times_retrieval():
     survivor, losers = choose_survivor(conn, [a, b], flood_cutoff="2026-06-29 18:00:00")
     assert survivor == b
     assert losers == [a]
+
+
+def test_plan_merge_does_not_delete_active_replacement_for_invalid_high_score_fact():
+    conn = _conn()
+    invalid = _add_fact(
+        conn,
+        "old dashboard port is 3000",
+        "2026-06-01 00:00:00",
+        trust=0.99,
+        retrieval=100,
+        invalid_at="2026-06-15 00:00:00",
+    )
+    active = _add_fact(
+        conn,
+        "dashboard port is 3100",
+        "2026-06-20 00:00:00",
+        trust=0.5,
+        retrieval=1,
+    )
+    _embed(conn, invalid, _vec(1.0, 0.0))
+    _embed(conn, active, _vec(0.999, 0.001))
+
+    plan = plan_merge(
+        conn,
+        threshold=0.92,
+        flood_cutoff="2026-06-29 18:00:00",
+        embedding_identity=_ID,
+    )
+
+    assert plan.clusters == []
 
 
 # ---------------------------------------------------------------------------

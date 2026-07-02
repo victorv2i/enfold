@@ -10,6 +10,7 @@ fully-inert behaviour when reflection is disabled.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 import types
@@ -230,6 +231,33 @@ def test_select_clusters_excludes_invalid_facts(tmp_path):
 
     clusters = select_clusters(conn, max_clusters=3)
     assert not any(a in cl for cl in clusters)
+
+
+def test_select_clusters_excludes_legacy_superseded_facts(tmp_path):
+    conn = _conn(tmp_path)
+    legacy = _add_fact(conn, "SUPERSEDED 2026-06-01: Alex Rivera moved to Springfield.")
+    active = _add_fact(conn, "Alex Rivera started a new job at Skylark.")
+    _link_entity(conn, legacy, "Alex Rivera")
+    _link_entity(conn, active, "Alex Rivera")
+
+    clusters = select_clusters(conn, max_clusters=3)
+    assert not any(legacy in cl for cl in clusters)
+
+
+def test_select_clusters_excludes_insight_facts_as_sources(tmp_path):
+    conn = _conn(tmp_path)
+    source = _add_fact(conn, "Alex Rivera moved to Springfield in March.")
+    insight = _add_fact(
+        conn,
+        "Alex Rivera relocation timing is tied to the Skylark role.",
+        category="insight",
+        tags=f"source_facts:{source}",
+    )
+    _link_entity(conn, source, "Alex Rivera")
+    _link_entity(conn, insight, "Alex Rivera")
+
+    clusters = select_clusters(conn, max_clusters=3)
+    assert not any(insight in cl for cl in clusters)
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +483,46 @@ def test_run_reflection_caps_clusters_per_run(make_provider, aux_module):
     aux_module.call_llm = lambda **kwargs: calls.append(1) or _llm_response("NONE")
     provider.run_reflection(now=time.time())
     assert len(calls) == 1
+
+
+def test_run_reflection_revalidates_cited_sources_before_insert(tmp_path, monkeypatch, caplog):
+    import enfold.reflection as reflection
+
+    conn = _conn(tmp_path)
+    a = _add_fact(conn, "Alex Rivera moved to Springfield in March.")
+    b = _add_fact(conn, "Alex Rivera started a new job at Skylark.")
+    _link_entity(conn, a, "Alex Rivera")
+    _link_entity(conn, b, "Alex Rivera")
+    inserted = []
+
+    def reflect_and_stale_source(facts, **kwargs):
+        conn.execute(
+            "UPDATE facts SET invalid_at = CURRENT_TIMESTAMP WHERE fact_id = ?",
+            (a,),
+        )
+        conn.commit()
+        return {
+            "insight": "Alex Rivera relocation timing is tied to the Skylark role.",
+            "source_fact_ids": [a, b],
+        }
+
+    monkeypatch.setattr(reflection, "reflect_on_cluster", reflect_and_stale_source)
+    caplog.set_level(logging.DEBUG, logger="enfold.reflection")
+
+    count = run_reflection(
+        conn,
+        now=time.time(),
+        enabled=True,
+        interval_hours=24,
+        max_clusters=3,
+        provider="testprov",
+        model="testmodel",
+        insert_fact=lambda content, category, tags: inserted.append((content, category, tags)) or 999,
+    )
+
+    assert count == 0
+    assert inserted == []
+    assert "skipped insight with stale source facts" in caplog.text
 
 
 # ---------------------------------------------------------------------------
