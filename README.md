@@ -8,47 +8,121 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
-  <img src="https://img.shields.io/badge/hermes--agent-memory%20plugin-8A2BE2" alt="Hermes Agent memory plugin">
   <img src="https://img.shields.io/badge/MCP-stdio%20server-1f6feb" alt="MCP stdio server">
+  <img src="https://img.shields.io/badge/hermes--agent-memory%20plugin-8A2BE2" alt="Hermes Agent memory plugin">
+  <img src="https://img.shields.io/badge/local--first-SQLite-044a10" alt="local-first SQLite">
 </p>
 
-Enfold is a hybrid long-term memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent), with an MCP server that shares the same memory with Claude Code, Codex CLI, or any MCP-capable agent. One local SQLite brain, every agent recalls the same facts.
+Enfold is local, private, long-term memory for AI agents: one SQLite file your agents read and write through meaning-aware recall. Claude Code, Codex CLI, and any MCP-capable agent connect through the bundled stdio MCP server. [Hermes Agent](https://github.com/NousResearch/hermes-agent) gets a deeper native integration as a drop-in memory provider. Point them all at the same database and they share one brain: a fact learned in one agent's session is recalled in every other agent's next one.
 
-It extends the bundled **holographic** (HRR) fact store with **dense semantic embeddings** and **LLM-based fact extraction**, then merges every signal in a single hybrid retrieval pass, so the agent recalls facts by *meaning*, not just keyword overlap, while keeping the holographic store's symbolic strengths. In a hologram, every fragment of the plate reconstructs the whole scene; Enfold treats memory the same way, so a partial cue is enough to bring back full context.
+The name is the design. In a hologram, every fragment of the plate reconstructs the whole scene. Enfold treats memory the same way: facts are stored once, atomically, and a partial cue (a paraphrase, an entity, a stray keyword) is enough to bring back full context.
 
-It does not replace the holographic provider, it subclasses it. All the holographic foundation (the SQLite fact store, FTS search, trust scoring, entity resolution, and HRR compositional retrieval) is dusterbloom's work; this plugin adds a layer on top. See [NOTICE](NOTICE).
+## Why Enfold
 
-## What it adds over base `holographic`
+- **Recall by meaning, not keywords.** Dense embeddings, BM25 keyword search, token overlap, and holographic (HRR) compositional retrieval are blended into one trust-weighted score. Paraphrases hit; so do exact ports, SHAs, and hostnames.
+- **One brain, many agents.** The MCP server and the Hermes gateway operate on the same SQLite file concurrently, with WAL plus a cross-process write lock. Every write carries a `source` tag, so you always know which agent learned what.
+- **Writes are gated, so the store stays clean.** Near-duplicate restatements are rejected at write time. A genuine value update (same fact, new number or state) supersedes the old fact instead of coexisting with it, and the history chain is preserved: invalidate, never delete.
+- **Local-first, nothing leaves your machine.** SQLite for storage, local embeddings via Ollama (GPU) or FastEmbed (CPU-only, zero infrastructure). If the embedder is down, recall degrades gracefully to keyword and symbolic search instead of failing.
+- **Measured, not vibes.** Ships a reproducible recall benchmark; every number in this README comes from a script in the repo. When a fashionable technique lost (a cross-encoder reranker, for one), it was dropped and the negative result documented.
+- **Built for unattended operation.** Fact extraction runs through a crash-safe SQLite queue with retries, backoff, and dead-letter rows. Sleep-time reflection distills grounded insights from clusters of related facts, with mandatory citations back to sources.
 
-- **Dense embedding retrieval.** Each fact is embedded into a sidecar `fact_embeddings` table; queries are scored by cosine similarity. This catches paraphrases and fuzzy matches that pure keyword/FTS search misses.
-- **Hybrid scoring.** Four signals merged per query: FTS keyword, Jaccard overlap, HRR compositional, and dense embedding, all on one trust-weighted scale. The weights genuinely partition the budget: the three holographic weights (defaults FTS 0.3, Jaccard 0.2, HRR 0.2) are rescaled by their own sum so they total exactly 1.0 inside the retriever, that holographic score then gets a `1 - embedding_weight` share of the final score and the dense cosine similarity gets the remaining `embedding_weight` share (default 0.3, so 70% holographic / 30% embedding). A fact with no stored embedding simply cannot earn the embedding share.
-- **LLM fact extraction.** At session end (and just before context compression) it extracts durable, atomic facts from the conversation so nothing important is lost when the window rolls over. Extraction uses your agent's own model by default, no hardcoded provider, and is configurable.
-- **Reliable extraction pipeline.** Transcripts are persisted to an on-disk queue and processed by a background worker, so extraction survives crashes and restarts and never blocks the session (see Reliability below).
-- **Graceful fallback.** If the embedding backend is unreachable, it silently falls back to holographic-only scoring, never a hard failure.
-- **Entity-graph boost (off by default).** The base store already links facts to entities it recognises in their text. When enabled, a query mentioning one of those entities boosts facts linked to it, and can optionally expand one hop to related facts that share the entity but have no lexical overlap with the query. High-degree "hub" entities (e.g. the user's own name) are excluded from expansion so they can't flood the results.
-
-## Requirements
-
-- A working Hermes Agent install (this is a plugin for it, and it subclasses the bundled `holographic` provider).
-- `numpy`.
-- One embedding backend:
-  - **FastEmbed**: local, CPU-only, recommended for privacy. `pip install fastembed`. The code default is `BAAI/bge-base-en-v1.5` (768-dim); set `fastembed_model` in config to run a larger model.
-  - **Ollama**: point `ollama_url` at a running server and pick an embedding `ollama_model`.
-
-## Install
-
-Hermes auto-discovers any memory-provider directory under `~/.hermes/plugins/`, so installation is a copy:
+## Quickstart: Claude Code
 
 ```bash
 git clone https://github.com/victorv2i/enfold.git
-cp -r enfold ~/.hermes/plugins/
+pip install mcp numpy fastembed
+
+claude mcp add enfold -- python3 /absolute/path/to/enfold/enfold/mcp_server.py \
+    --db-path ~/enfold-memory.db \
+    --embedding-backend fastembed
 ```
 
-Then select it as your provider:
+That's the whole setup. Your agent now has `memory_search`, `memory_add`, `memory_supersede`, `memory_explain`, and `memory_history`. No server to babysit, no container, no cloud.
+
+Two things to know:
+
+- Run the server **by file path**, never `python -m` (details in [MCP server](#mcp-server)).
+- Without a Hermes checkout, the server runs on a bundled lightweight engine (real SQLite, FTS5, trust scores, and entity links; the same harness the 300-test suite runs against). For the full holographic engine, add `--hermes-src /path/to/hermes-agent/src`. A plain `git clone` of hermes-agent is enough: no install, no running gateway.
+
+## Quickstart: Codex CLI
+
+In `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.enfold]
+command = "python3"
+args = ["/absolute/path/to/enfold/enfold/mcp_server.py",
+        "--db-path", "/home/you/enfold-memory.db",
+        "--embedding-backend", "fastembed"]
+```
+
+Any other MCP-capable agent wires up the same way: it is a plain stdio MCP server.
+
+## Quickstart: Hermes Agent (native provider)
+
+Hermes auto-discovers memory-provider directories under `~/.hermes/plugins/`, so installation is a copy:
 
 ```bash
+git clone https://github.com/victorv2i/enfold.git
+cp -r enfold/enfold ~/.hermes/plugins/
 hermes config set memory.provider enfold
 ```
+
+As a native provider, Enfold does more than serve tools: it prefetches relevant facts into context every turn, extracts durable facts from conversations at session end and before context compression, and keeps the embedding sidecar in sync on every write.
+
+To share the gateway's store with your other agents, point the MCP server at the same file and matching geometry:
+
+```bash
+python3 enfold/mcp_server.py \
+    --db-path ~/.hermes/memory_store.db \
+    --hermes-src ~/hermes-agent/src \
+    --hrr-dim <your gateway's hrr_dim>
+```
+
+## What it adds over base `holographic`
+
+Enfold does not replace the bundled Hermes holographic provider, it subclasses it. The foundation (SQLite fact store, FTS search, trust scoring, entity resolution, HRR compositional retrieval) is dusterbloom's work; see [NOTICE](NOTICE). On top of it:
+
+- **Dense embedding retrieval.** Each fact is embedded into a sidecar `fact_embeddings` table; queries are scored by cosine similarity. This catches paraphrases and fuzzy matches that pure keyword/FTS search misses.
+- **Hybrid scoring.** Four signals merged per query: FTS keyword, Jaccard overlap, HRR compositional, and dense embedding, all on one trust-weighted scale. The weights genuinely partition the budget: the three holographic weights (defaults FTS 0.3, Jaccard 0.2, HRR 0.2) are rescaled by their own sum so they total exactly 1.0 inside the retriever, that holographic score then gets a `1 - embedding_weight` share of the final score and the dense cosine similarity gets the remaining `embedding_weight` share (default 0.3, so 70% holographic / 30% embedding). A fact with no stored embedding simply cannot earn the embedding share.
+- **Write-time dedup.** Adds are checked against existing facts with a token-Jaccard gate and a semantic cosine gate. A changed number, id, or state word is never treated as a duplicate (an update must always land), and an antonym-flip guard keeps opposite-meaning paraphrases apart.
+- **Temporal validity.** Value updates supersede the prior fact (`valid_from` / `invalid_at` / `superseded_by`), superseded facts stop surfacing in search, and `memory_history` walks the chain. Invalidate, never delete.
+- **LLM fact extraction.** At session end (and just before context compression) it extracts durable, atomic facts from the conversation so nothing important is lost when the window rolls over. Extraction uses your agent's own model by default, no hardcoded provider, and is configurable.
+- **Reliable extraction pipeline.** Transcripts are persisted to an on-disk queue and processed by a background worker, so extraction survives crashes and restarts and never blocks the session (see [Reliability](#reliability)).
+- **Sleep-time reflection.** On a configurable interval, clusters of related facts are distilled into grounded insight facts with mandatory citations to their sources; an insight is invalidated automatically when its sources are superseded.
+- **Entity-graph boost (off by default).** The base store links facts to entities it recognises. When enabled, a query mentioning an entity boosts facts linked to it, and can expand one hop to related facts with no lexical overlap with the query. High-degree hub entities (e.g. the user's own name) are excluded so they can't flood results.
+- **Graceful fallback.** If the embedding backend is unreachable, it silently falls back to holographic-only scoring, never a hard failure.
+
+## Benchmarks
+
+A reproducible recall benchmark (`tests/eval.py` for the dense layer, plus an end-to-end provider sweep over a 120-fact / 72-query set with hard distractor clusters) gives a clear picture for a single-user self-hosted store. End-to-end recall@1 / MRR through the real provider:
+
+```
+bge-large, no prefix, HRR on (typical default)    r@1 0.69   MRR 0.79
+bge-large, +prefix, HRR on                        r@1 0.78   MRR 0.85
+embeddinggemma, +prefix, HRR off                  r@1 0.90   MRR 0.94
+```
+
+What the sweep taught us:
+
+- The dense embedding model is the dominant lever. The embedding weight and the HRR signal do not move recall on semantic / paraphrase queries, where keyword search has little to grip; the large per-fact HRR vector is effectively dead weight there.
+- Instruction prefixes matter: `embedding_prefix_policy: auto` applies each model's documented query/passage prefixes and is worth several recall points on models tuned for them.
+- A final-stage cross-encoder reranker did not help on short atomic facts paired with a strong embedder; it regressed recall, so it is not recommended here.
+
+Recommended configuration (GPU via Ollama):
+
+```yaml
+plugins:
+  hermes-memory-store:
+    embedding_backend: ollama
+    ollama_model: embeddinggemma            # 768-dim, Apache-2.0
+    embedding_prefix_policy: auto
+    hrr_weight: 0                           # HRR adds no measured recall here; frees storage
+```
+
+CPU-only alternative: `embedding_backend: fastembed`, `fastembed_model: snowflake/snowflake-arctic-embed-l`, `embedding_prefix_policy: auto`.
+
+These numbers are from one synthetic set, so treat small gaps as noise and re-run `tests/eval.py` on your own data before committing to a change.
 
 ## Configuration
 
@@ -62,6 +136,9 @@ plugins:
     embedding_prefix_policy: none           # "none" (default) or "auto": apply the model's documented query/passage prefixes
     # fts_weight / jaccard_weight / hrr_weight default 0.3 / 0.2 / 0.2 and are
     # rescaled to sum to 1.0; set hrr_weight: 0 to disable the HRR signal.
+    dedup_on_add: true                      # write-time near-duplicate gate
+    dedup_jaccard: 0.9                      # token-overlap threshold for the lexical gate
+    dedup_cosine: 0.92                      # cosine threshold for the semantic gate
     retrieval_decision_enabled: false       # optional calibrated final-stage filter/abstention gates
     # retrieval_decision_min_score: 0.5      # drop candidates below this final score when enabled
     # retrieval_decision_min_margin: 0.02    # abstain when top-2 filtered scores are too close
@@ -69,6 +146,8 @@ plugins:
     entity_boost_weight: 0.0                # additive boost for facts linked to a query-mentioned entity (default off)
     entity_expansion: false                 # 1-hop expansion to facts sharing an entity with a top hit (default off)
     entity_hub_degree_limit: 25             # entities linked to more facts than this are excluded from expansion
+    reflection_enabled: false               # sleep-time reflection insights (default off)
+    reflection_interval_hours: 24
     embed_on_add: true                      # embed a fact immediately when it is added
     fastembed_model: BAAI/bge-base-en-v1.5  # 768-dim, local
     ollama_url: http://localhost:11434      # only if embedding_backend: ollama
@@ -83,109 +162,32 @@ plugins:
 
 Embeddings are **identity-versioned** (`backend:model:role:vN`), so switching models never corrupts existing vectors: each model's vectors live under their own identity, and the new model's are backfilled in the background. On startup, any fact missing a current-identity embedding is backfilled in a non-blocking background thread (in batches), and the worker re-runs the backfill periodically so transient embedding failures heal on their own. Vectors from a superseded model are kept until you reclaim them: call `provider.vacuum_embeddings()` to drop them without re-embedding, or `rebuild_embeddings()`, which prunes them after re-embedding.
 
-## Recommended configuration
-
-A reproducible recall benchmark (`tests/eval.py` for the dense layer, plus an
-end-to-end provider sweep over a 120-fact / 72-query set with hard distractor
-clusters) gives a clear picture for a single-user self-hosted store:
-
-- The dense embedding model is the dominant lever. The embedding weight and the
-  HRR signal do not move recall on semantic / paraphrase queries, where keyword
-  search has little to grip; the large per-fact HRR vector is effectively dead
-  weight there.
-- A final-stage cross-encoder reranker did not help on short atomic facts paired
-  with a strong embedder; it regressed recall, so it is not recommended here.
-
-End-to-end recall@1 / MRR through the provider:
-
-```
-bge-large, no prefix, HRR on (typical default)   r@1 0.69   MRR 0.79
-bge-large, +prefix, HRR on                        r@1 0.78   MRR 0.85
-embeddinggemma, +prefix, HRR off                  r@1 0.90   MRR 0.94
-```
-
-Recommended (GPU via Ollama):
-
-```yaml
-plugins:
-  hermes-memory-store:
-    embedding_backend: ollama
-    ollama_model: embeddinggemma            # 768-dim, Apache-2.0
-    embedding_prefix_policy: auto
-    hrr_weight: 0                           # HRR adds no measured recall here; frees storage
-```
-
-CPU-only alternative: `embedding_backend: fastembed`,
-`fastembed_model: snowflake/snowflake-arctic-embed-l`, `embedding_prefix_policy: auto`.
-
-These numbers are from one synthetic set, so treat small gaps as noise and re-run
-`tests/eval.py` on your own data before committing to a change.
-
 ## Tools
 
-It inherits the base `fact_store` tool (add / search / probe / related / reason / contradict / update / remove / list) and `fact_feedback` (rate facts helpful/unhelpful to train trust). The `search` action is overridden to merge dense-embedding similarity into the ranked results.
+As a Hermes provider it inherits the base `fact_store` tool (add / search / probe / related / reason / contradict / update / remove / list) and `fact_feedback` (rate facts helpful/unhelpful to train trust). The `search` action is overridden to merge dense-embedding similarity into the ranked results.
 
 ## MCP server
 
-`enfold/mcp_server.py` exposes the same fact store over the Model
-Context Protocol (stdio transport), so a coding agent that isn't Hermes (Claude
-Code, Codex CLI) can read and write it directly, while the Hermes gateway keeps
-using the store in-process as usual. Both sides see the same facts because
-they point at the same `db_path`.
+`enfold/mcp_server.py` exposes the fact store over the Model Context Protocol (stdio transport). It registers `memory_search`, `memory_add`, `memory_supersede`, `memory_explain`, and `memory_history`. `--read-only` registers only search, explain, and history (the two writes are never registered at all in this mode, not just blocked at call time).
 
-Tools registered: `memory_search`, `memory_add`, `memory_supersede`,
-`memory_explain`, `memory_history`. `--read-only` registers only the first,
-third, and fifth (the two writes, `memory_add` and `memory_supersede`, are
-never registered at all in this mode, not just blocked at call time).
-
-The `mcp` package (FastMCP) is an optional dependency, only needed to run this
-server, never to import `enfold` as a Hermes plugin:
-
-```bash
-pip install mcp
-```
+The `mcp` package (FastMCP) is an optional dependency, only needed to run this server, never to import `enfold` as a Hermes plugin.
 
 Run the server **by file path**, not with `-m`:
 
 ```bash
-python enfold/mcp_server.py \
+python3 enfold/mcp_server.py \
     --db-path ~/.hermes/memory_store.db \
     --ollama-url http://localhost:11434 \
     --ollama-model embeddinggemma:latest
 ```
 
-`python -m enfold.mcp_server` (or anything that imports
-`enfold` as a package before this module resolves its own parent
-Hermes checkout) triggers `enfold/__init__.py`'s unconditional
-`plugins.memory.holographic` import at module load time. On a host with a
-second, unrelated Hermes install already on `sys.path`, that import can win
-silently and this module never gets to point at the checkout you actually
-meant (`ENFOLD_HERMES_SRC`, see `mcp_provider.py`). Running the file
-directly sidesteps `__init__.py` entirely, which is why every example here
-uses the file path.
+`python -m enfold.mcp_server` (or anything that imports `enfold` as a package before this module resolves its own parent Hermes checkout) triggers `enfold/__init__.py`'s unconditional `plugins.memory.holographic` import at module load time. On a host with a second, unrelated Hermes install already on `sys.path`, that import can win silently and this module never gets to point at the checkout you actually meant (`ENFOLD_HERMES_SRC`, see `mcp_provider.py`). Running the file directly sidesteps `__init__.py` entirely, which is why every example here uses the file path.
 
-`--hrr-dim` must match the `hrr_dim` the host Hermes gateway is configured
-with for this same store. There is no auto-detection: a mismatched dimension
-does not error at startup, it crashes later, the first time HRR scoring runs
-against a vector encoded at the other dimension.
+When sharing a store with a live Hermes gateway, `--hrr-dim` must match the `hrr_dim` the gateway is configured with. There is no auto-detection: a mismatched dimension does not error at startup, it crashes later, the first time HRR scoring runs against a vector encoded at the other dimension.
 
-Every write must carry a `source` tag, one of `claude-code`, `codex`, or
-`other`; `memory_add` and `memory_supersede` reject a call without one. The
-tag is appended to the fact's `tags` as `source:<agent>`, so it's visible
-alongside the fact everywhere tags already show up. Writes from the MCP server
-go through the exact same dedup and value-update-supersession gates as a live
-Hermes write: a near-duplicate is rejected and the existing fact's id
-returned instead of storing again, and a genuine value update (same wording,
-a changed number/id/state word) supersedes the prior fact automatically.
+Every write must carry a `source` tag, one of `claude-code`, `codex`, or `other`; `memory_add` and `memory_supersede` reject a call without one. The tag is appended to the fact's `tags` as `source:<agent>`, so it's visible alongside the fact everywhere tags already show up. Writes from the MCP server go through the exact same dedup and value-update-supersession gates as a live Hermes write: a near-duplicate is rejected and the existing fact's id returned instead of storing again, and a genuine value update (same wording, a changed number/id/state word) supersedes the prior fact automatically.
 
-Concurrency: the store runs in SQLite WAL mode with `busy_timeout` set on the
-connection, and a enfold write is several separate short
-transactions (dedup search, insert, bank rebuild, optional supersession), not
-one, so `busy_timeout` alone cannot make that whole sequence atomic across two
-processes. Every MCP write additionally takes an OS advisory file lock
-(`flock` on a `<db_path>.mcp-write.lock` sidecar) for its whole duration, so
-writes from separate MCP server processes (e.g. one for Claude Code, one for
-Codex) are fully serialized against each other rather than racing.
+Concurrency: the store runs in SQLite WAL mode with `busy_timeout` set on the connection, and an Enfold write is several separate short transactions (dedup search, insert, bank rebuild, optional supersession), not one, so `busy_timeout` alone cannot make that whole sequence atomic across two processes. Every MCP write additionally takes an OS advisory file lock (`flock` on a `<db_path>.mcp-write.lock` sidecar) for its whole duration, so writes from separate MCP server processes (e.g. one for Claude Code, one for Codex) are fully serialized against each other rather than racing.
 
 ## How it works
 
@@ -224,11 +226,19 @@ blend*            0.81      0.88      0.88    0.86
 
 The dense-embedding layer roughly doubles recall@1 over keyword (0.38 → 0.81) on paraphrased queries, the exact case where keyword search fails. `*` The `blend` row is an *illustrative* keyword+embedding mix for this isolated comparison; it is **not** the formula the plugin ships. The real scorer adds the trust-weighted embedding onto the trust-weighted holographic score across FTS+Jaccard+HRR (see `_blend_score`). The keyword and HRR signals earn their weight on literal and compositional queries, which this benchmark intentionally underweights. It is a synthetic, illustrative benchmark, not a production guarantee, but every number is reproducible from the script.
 
+There is also a larger harness under `memory_eval/` for end-to-end sweeps against a real database snapshot.
+
+## Requirements
+
+- Python 3 (developed and tested on 3.13) and `numpy`.
+- For the MCP server: `pip install mcp`, plus one embedding backend (`fastembed` for CPU-only, or a running Ollama for GPU).
+- For the Hermes provider: a working Hermes Agent install.
+
 ## Credits
 
 Built on the **holographic** memory provider by **dusterbloom** (NousResearch/hermes-agent, PR #2351), which implements **Holographic Reduced Representations**: Tony A. Plate, *"Holographic Reduced Representations,"* IEEE Transactions on Neural Networks 6(3):623-641, 1995. Full attribution in [NOTICE](NOTICE).
 
-The dense-embedding retrieval, LLM fact extraction, and hybrid scoring are this project's contribution.
+The dense-embedding retrieval, LLM fact extraction, write gates, temporal supersession, reflection, MCP server, and hybrid scoring are this project's contribution.
 
 ## License
 
