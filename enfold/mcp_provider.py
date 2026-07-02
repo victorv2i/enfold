@@ -5,13 +5,14 @@ same way the offline ``explain.py`` CLI does, but resolves the parent
 ``plugins.memory.holographic`` modules from one of two sources:
 
   1. A real Hermes checkout, pointed at by the ``ENFOLD_HERMES_SRC`` env var
-     (default ``~/hermes-migration-stage/src`` on this box). This is how the
-     server shares the *exact* live store the Hermes gateway writes to.
+     or ``--hermes-src``. This is how the server shares the *exact* live
+     store the Hermes gateway writes to.
   2. The repo's bundled ``tests/fake_hermes`` stubs, as a documented fallback
-     for a host with no Hermes install (matches the test suite's own harness).
+     for a host with no Hermes install and no explicit source (matches the
+     test suite's own harness).
 
-Resolution never raises: if the configured real source is missing or fails
-to import, it logs and falls back to the stubs, so the server always starts.
+If a source is explicit and cannot be used, startup fails closed. Silent
+fallback to the stubs is only for the default auto-discovery path.
 """
 
 from __future__ import annotations
@@ -22,10 +23,12 @@ import logging
 import os
 import sqlite3
 import sys
+import threading
 import time
 import types
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,32 @@ DEFAULT_PREFIX_POLICY = "auto"
 DEFAULT_BUSY_TIMEOUT_MS = 5000
 
 _PARENT_PKG = "plugins.memory.holographic"
+_MODULE_RESTORE_PREFIXES = ("agent", "plugins", "hermes_state")
+
+
+def _canonical_db_path(db_path: str) -> str:
+    return str(Path(db_path).expanduser().resolve())
+
+
+def _sqlite_readonly_uri(db_path: str) -> str:
+    return f"file:{quote(_canonical_db_path(db_path), safe='/')}?mode=ro"
+
+
+def _module_snapshot() -> dict[str, Any]:
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if any(name == prefix or name.startswith(prefix + ".") for prefix in _MODULE_RESTORE_PREFIXES)
+    }
+
+
+def _restore_modules(snapshot: dict[str, Any]) -> None:
+    for name in list(sys.modules):
+        if any(name == prefix or name.startswith(prefix + ".") for prefix in _MODULE_RESTORE_PREFIXES):
+            if name not in snapshot:
+                sys.modules.pop(name, None)
+    for name, module in snapshot.items():
+        sys.modules[name] = module
 
 
 def _real_parent_available(hermes_src: str) -> bool:
@@ -122,33 +151,53 @@ def resolve_parent_modules(hermes_src: Optional[str] = None) -> str:
     """Ensure ``plugins.memory.holographic`` is importable; return which source was used.
 
     Returns ``"real"`` or ``"fake_hermes"``. Tries the real checkout first
-    (env var ``ENFOLD_HERMES_SRC``, else ``DEFAULT_HERMES_SRC``); falls back
-    to the bundled stubs on any failure, and never raises.
+    (explicit arg, env var ``ENFOLD_HERMES_SRC``, else ``DEFAULT_HERMES_SRC``).
+    Explicit sources fail closed on missing or broken imports. The bundled
+    stubs are used only when no source was specified.
     """
-    if _PARENT_PKG in sys.modules and hasattr(sys.modules[_PARENT_PKG], "HolographicMemoryProvider"):
+    env_src = os.environ.get("ENFOLD_HERMES_SRC")
+    explicit_src = hermes_src is not None or env_src is not None
+    src = hermes_src or env_src or DEFAULT_HERMES_SRC
+
+    if explicit_src and not _real_parent_available(src):
+        raise RuntimeError(
+            f"explicit Hermes source {src!r} is missing plugins.memory.holographic "
+            "retrieval.py or store.py"
+        )
+
+    if (
+        not explicit_src
+        and _PARENT_PKG in sys.modules
+        and hasattr(sys.modules[_PARENT_PKG], "HolographicMemoryProvider")
+    ):
         # Already resolved in this process (real, fake_hermes, or installed by
         # something else, e.g. the test suite's own conftest.py); reuse it
         # rather than re-importing. Anything installed without going through
         # this module (no source marker) is assumed to be the fake stubs,
         # since that is the only other installer in this codebase.
-        return getattr(sys.modules[_PARENT_PKG], "_enfold_mcp_source", "fake_hermes")
+        used = getattr(sys.modules[_PARENT_PKG], "_enfold_mcp_source", "fake_hermes")
+        logger.info("enfold MCP: resolved parent engine %s", used)
+        return used
 
-    src = hermes_src or os.environ.get("ENFOLD_HERMES_SRC", DEFAULT_HERMES_SRC)
     if _real_parent_available(src):
+        snapshot = _module_snapshot()
         try:
             _install_real_parent(src)
             sys.modules[_PARENT_PKG]._enfold_mcp_source = "real"
             logger.info("enfold MCP: using real hermes parent at %s", src)
+            logger.info("enfold MCP: resolved parent engine real")
             return "real"
         except Exception as exc:
+            _restore_modules(snapshot)
+            if explicit_src:
+                raise RuntimeError(
+                    f"explicit Hermes source {src!r} failed to import: {exc}"
+                ) from exc
             logger.warning(
                 "enfold MCP: real hermes parent at %s failed to import (%s), "
                 "falling back to fake_hermes stubs",
                 src, exc,
             )
-            for name in list(sys.modules):
-                if name == _PARENT_PKG or name.startswith(_PARENT_PKG + "."):
-                    sys.modules.pop(name, None)
 
     _install_fake_parent()
     sys.modules[_PARENT_PKG]._enfold_mcp_source = "fake_hermes"
@@ -157,6 +206,7 @@ def resolve_parent_modules(hermes_src: Optional[str] = None) -> str:
         "using tests/fake_hermes stubs",
         src,
     )
+    logger.info("enfold MCP: resolved parent engine fake_hermes")
     return "fake_hermes"
 
 
@@ -191,6 +241,85 @@ def check_journal_mode(db_path: str) -> str:
         conn.close()
 
 
+class _ReadOnlyStore:
+    def __init__(self, db_path: str, hrr_dim: int) -> None:
+        self.db_path = _canonical_db_path(db_path)
+        self.hrr_dim = hrr_dim
+        self._hrr_available = True
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(
+            _sqlite_readonly_uri(self.db_path),
+            uri=True,
+            check_same_thread=False,
+            timeout=10.0,
+        )
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA query_only = ON")
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+def _readonly_embed_store(hp, conn: sqlite3.Connection, identity: str, lock):
+    embed_store = object.__new__(hp.EmbedStore)
+    embed_store._conn = conn
+    embed_store._lock = lock if lock is not None else threading.RLock()
+    embed_store._embedding_identity = identity
+    embed_store._cache_ids = None
+    embed_store._cache_matrix = None
+    embed_store._cache_dim = None
+    embed_store._cache_identity = None
+    return embed_store
+
+
+def _configure_read_only_provider(provider, hp, session_id: str, hrr_dim: int) -> None:
+    provider._store = _ReadOnlyStore(provider._config["db_path"], hrr_dim)
+    provider._session_id = session_id
+
+    temporal_decay = int(provider._config.get("temporal_decay_half_life", 0))
+    fts_cfg = float(provider._config.get("fts_weight", hp._FTS_W))
+    jac_cfg = float(provider._config.get("jaccard_weight", hp._JACCARD_W))
+    hrr_cfg = float(provider._config.get("hrr_weight", hp._HRR_W))
+    holo_sum = fts_cfg + jac_cfg + hrr_cfg
+    if holo_sum <= 0:
+        fts_cfg, jac_cfg, hrr_cfg = hp._FTS_W, hp._JACCARD_W, hp._HRR_W
+        holo_sum = hp._FTS_W + hp._JACCARD_W + hp._HRR_W
+
+    provider._retriever = hp.PlusFactRetriever(
+        store=provider._store,
+        temporal_decay_half_life=temporal_decay,
+        fts_weight=fts_cfg / holo_sum,
+        jaccard_weight=jac_cfg / holo_sum,
+        hrr_weight=hrr_cfg / holo_sum,
+        hrr_dim=hrr_dim,
+        entity_boost_weight=float(provider._config.get("entity_boost_weight", 0.0)),
+        entity_expansion=hp._cfg_bool(provider._config.get("entity_expansion"), False),
+        entity_hub_degree_limit=int(provider._config.get("entity_hub_degree_limit", 25)),
+    )
+
+    try:
+        provider._embedder = provider._create_embedder()
+        provider._embedder_available = bool(provider._embedder.is_available())
+    except Exception as exc:
+        logger.debug("enfold MCP: read-only embedder unavailable: %s", exc)
+        provider._embedder = None
+        provider._embedder_available = False
+
+    provider._embed_store = _readonly_embed_store(
+        hp,
+        provider._store._conn,
+        provider._embedding_identity("document"),
+        getattr(provider._store, "_lock", None),
+    )
+    provider._embed_pool = None
+    provider._backfill_thread = None
+    provider._backfill_stop = None
+    provider._extract_queue = None
+    provider._queue_worker = None
+    provider._queue_stop = None
+    provider._queue_wake = None
+
+
 def build_provider(
     *,
     db_path: str,
@@ -204,6 +333,7 @@ def build_provider(
     dedup_cosine: float = 0.92,
     busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
     session_id: str = "mcp-server",
+    read_only: bool = False,
 ):
     """Construct and initialize a EnfoldProvider against *db_path*.
 
@@ -216,11 +346,13 @@ def build_provider(
     The caller owns the returned provider's lifecycle (call ``.shutdown()``
     when done); this mirrors the ``explain.py`` CLI's own usage.
     """
-    resolve_parent_modules(hermes_src)
+    parent_source = resolve_parent_modules(hermes_src)
+    logger.info("enfold MCP: startup parent engine %s", parent_source)
     hp = _load_enfold_module()
+    canonical_path = _canonical_db_path(db_path)
 
     config = {
-        "db_path": db_path,
+        "db_path": canonical_path,
         "embedding_backend": embedding_backend if embedding_backend != "fake" else "ollama",
         "ollama_url": ollama_url,
         "ollama_model": ollama_model,
@@ -246,7 +378,10 @@ def build_provider(
     else:
         provider = hp.EnfoldProvider(config=config)
 
-    _initialize_with_retry(provider, session_id)
+    if read_only:
+        _configure_read_only_provider(provider, hp, session_id, hrr_dim)
+    else:
+        _initialize_with_retry(provider, session_id)
     _apply_busy_timeout(provider, busy_timeout_ms)
     return provider
 

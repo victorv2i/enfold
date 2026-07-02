@@ -17,6 +17,11 @@ in --read-only mode (registered but return errors is NOT the read-only
 contract here: the tools simply do not exist, so a read-only client can
 never even attempt one).
 
+In --read-only mode the provider is also opened read-only. Startup skips all
+mutating initialization work: schema migrations, WAL checkpoints, embedding
+backfill, extraction queue workers, and reflection passes. The server can
+search existing stores but will not create or repair database objects.
+
 Run directly (run the file by path, NOT `python -m enfold.mcp_server`;
 see the warning below for why):
 
@@ -47,6 +52,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import importlib.util
+import logging
 import sqlite3
 import sys
 import time
@@ -92,8 +98,15 @@ except ImportError as exc:  # pragma: no cover - exercised only without the dep
 
 
 VALID_SOURCES = ("claude-code", "codex", "other")
+MAX_CONTENT_CHARS = 16_000
+MAX_QUERY_CHARS = 16_000
+MAX_TAGS_CHARS = 2_000
+MAX_CATEGORY_CHARS = 128
+MIN_LIMIT = 1
+MAX_LIMIT = 50
 
 _T = TypeVar("_T")
+logger = logging.getLogger(__name__)
 
 
 @contextlib.contextmanager
@@ -121,7 +134,7 @@ def _cross_process_write_lock(db_path: str) -> Iterator[None]:
     if fcntl is None:  # pragma: no cover - posix-only
         yield
         return
-    lock_path = f"{db_path}.mcp-write.lock"
+    lock_path = f"{Path(db_path).expanduser().resolve()}.mcp-write.lock"
     fh = open(lock_path, "a+")
     try:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
@@ -158,8 +171,42 @@ def _require_source(args: Dict[str, Any]) -> Optional[str]:
     source = args.get("source")
     if not source:
         return "missing required argument: source (one of claude-code, codex, other)"
+    if not isinstance(source, str):
+        return "invalid source: must be a string"
     if source not in VALID_SOURCES:
         return f"invalid source {source!r}; must be one of {VALID_SOURCES}"
+    return None
+
+
+def _require_string(name: str, value: Any, max_chars: int, *, non_blank: bool = False) -> Optional[str]:
+    if not isinstance(value, str):
+        return f"invalid {name}: must be a string"
+    if len(value) > max_chars:
+        return f"invalid {name}: exceeds {max_chars} characters"
+    if non_blank and not value.strip():
+        return f"invalid {name}: must not be blank"
+    return None
+
+
+def _validated_limit(limit: Any) -> tuple[Optional[int], Optional[str]]:
+    if isinstance(limit, bool):
+        return None, "invalid limit: must be an integer"
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        return None, "invalid limit: must be an integer"
+    return max(MIN_LIMIT, min(MAX_LIMIT, value)), None
+
+
+def _validate_fact_args(content: Any, category: Any, tags: Any) -> Optional[str]:
+    for name, value, max_chars, non_blank in (
+        ("content", content, MAX_CONTENT_CHARS, True),
+        ("category", category, MAX_CATEGORY_CHARS, False),
+        ("tags", tags, MAX_TAGS_CHARS, False),
+    ):
+        error = _require_string(name, value, max_chars, non_blank=non_blank)
+        if error:
+            return error
     return None
 
 
@@ -174,12 +221,60 @@ def _json_safe_fact(fact: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _tag_source(tags: str, source: str) -> str:
-    """Append a `source:<agent>` marker to *tags*, comma-separated."""
+    """Replace inbound source markers with exactly one canonical marker."""
     marker = f"source:{source}"
-    existing = [t for t in (tags or "").split(",") if t.strip()]
-    if marker not in existing:
-        existing.append(marker)
+    existing = [
+        t.strip()
+        for t in (tags or "").split(",")
+        if t.strip() and not t.strip().lower().startswith("source:")
+    ]
+    existing.append(marker)
     return ",".join(existing)
+
+
+def _active_fact_exists(provider, fact_id: int) -> bool:
+    store = getattr(provider, "_store", None)
+    conn = getattr(store, "_conn", None)
+    if conn is None:
+        return False
+    row = conn.execute(
+        "SELECT fact_id FROM facts WHERE fact_id = ? AND invalid_at IS NULL",
+        (fact_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _supersede_with_rowcount(provider, old_fact_id: int, new_fact_id: int) -> bool:
+    store = getattr(provider, "_store", None)
+    conn = getattr(store, "_conn", None)
+    if conn is None:
+        return False
+    lock = getattr(store, "_lock", None)
+
+    def _update() -> bool:
+        cur = conn.execute(
+            """
+            UPDATE facts
+               SET invalid_at = CURRENT_TIMESTAMP,
+                   superseded_by = ?
+             WHERE fact_id = ? AND invalid_at IS NULL
+            """,
+            (new_fact_id, old_fact_id),
+        )
+        conn.commit()
+        if int(cur.rowcount) != 1:
+            return False
+        try:
+            reflection = importlib.import_module("enfold.reflection")
+            reflection.invalidate_insights_citing(conn, old_fact_id)
+        except Exception as exc:
+            logger.debug("enfold MCP: insight invalidation failed: %s", exc)
+        return True
+
+    if lock is not None:
+        with lock:
+            return _update()
+    return _update()
 
 
 def build_server(provider, read_only: bool = False) -> "FastMCP":
@@ -190,34 +285,50 @@ def build_server(provider, read_only: bool = False) -> "FastMCP":
     registered at all.
     """
     server = FastMCP("enfold-memory")
-    db_path = str(provider._store.db_path)
+    db_path = str(Path(provider._store.db_path).expanduser().resolve())
 
     @server.tool()
-    def memory_search(query: str, limit: int = 10) -> Dict[str, Any]:
+    def memory_search(query: Any, limit: Any = 10) -> Dict[str, Any]:
         """Hybrid search (FTS + Jaccard + HRR + dense embedding) over the shared fact store."""
-        results = provider.search(query, limit=limit, bump=False)
+        error = _require_string("query", query, MAX_QUERY_CHARS)
+        if error:
+            return {"error": error}
+        safe_limit, error = _validated_limit(limit)
+        if error:
+            return {"error": error}
+        results = provider.search(query, limit=safe_limit, bump=False)
         return {"results": results, "count": len(results)}
 
     @server.tool()
-    def memory_explain(query: str, limit: int = 10) -> Dict[str, Any]:
+    def memory_explain(query: Any, limit: Any = 10) -> Dict[str, Any]:
         """Per-candidate scoring breakdown for *query* (same pass memory_search uses)."""
-        breakdown = provider.explain_search(query, limit=limit)
+        error = _require_string("query", query, MAX_QUERY_CHARS)
+        if error:
+            return {"error": error}
+        safe_limit, error = _validated_limit(limit)
+        if error:
+            return {"error": error}
+        breakdown = provider.explain_search(query, limit=safe_limit)
         return {"breakdown": breakdown}
 
     @server.tool()
-    def memory_history(fact_id: int) -> Dict[str, Any]:
+    def memory_history(fact_id: Any) -> Dict[str, Any]:
         """Full supersession chain containing *fact_id*, oldest first."""
-        return {"history": [_json_safe_fact(f) for f in provider.fact_history(int(fact_id))]}
+        try:
+            safe_fact_id = int(fact_id)
+        except (TypeError, ValueError):
+            return {"error": "invalid fact_id: must be an integer"}
+        return {"history": [_json_safe_fact(f) for f in provider.fact_history(safe_fact_id)]}
 
     if read_only:
         return server
 
     @server.tool()
     def memory_add(
-        content: str,
-        source: str,
-        category: str = "general",
-        tags: str = "",
+        content: Any,
+        source: Any,
+        category: Any = "general",
+        tags: Any = "",
     ) -> Dict[str, Any]:
         """Add a fact, tagged with its originating agent.
 
@@ -232,6 +343,9 @@ def build_server(provider, read_only: bool = False) -> "FastMCP":
         """
         args = {"content": content, "category": category, "source": source}
         error = _require_source(args)
+        if error:
+            return {"error": error}
+        error = _validate_fact_args(content, category, tags)
         if error:
             return {"error": error}
 
@@ -263,11 +377,11 @@ def build_server(provider, read_only: bool = False) -> "FastMCP":
 
     @server.tool()
     def memory_supersede(
-        old_fact_id: int,
-        new_content: str,
-        source: str,
-        category: str = "general",
-        tags: str = "",
+        old_fact_id: Any,
+        new_content: Any,
+        source: Any,
+        category: Any = "general",
+        tags: Any = "",
     ) -> Dict[str, Any]:
         """Explicitly supersede old_fact_id with a new fact (invalidate-not-delete).
 
@@ -280,17 +394,33 @@ def build_server(provider, read_only: bool = False) -> "FastMCP":
         error = _require_source(args)
         if error:
             return {"error": error}
+        error = _validate_fact_args(new_content, category, tags)
+        if error:
+            return {"error": error}
+        try:
+            safe_old_fact_id = int(old_fact_id)
+        except (TypeError, ValueError):
+            return {"error": "invalid old_fact_id: must be a positive integer"}
+        if safe_old_fact_id <= 0:
+            return {"error": "invalid old_fact_id: must be a positive integer"}
+        if not _active_fact_exists(provider, safe_old_fact_id):
+            return {"error": "invalid old_fact_id: active fact not found"}
 
         tagged = _tag_source(tags, source)
 
         def _do_supersede() -> Dict[str, Any]:
             new_fact_id = provider._store.add_fact(new_content, category=category, tags=tagged)
             provider._embed_cb(new_fact_id, new_content)
-            provider._supersede_fact(int(old_fact_id), int(new_fact_id))
+            if not _supersede_with_rowcount(provider, safe_old_fact_id, int(new_fact_id)):
+                return {
+                    "fact_id": new_fact_id,
+                    "status": "failed",
+                    "error": "supersede failed: old fact was not updated",
+                }
             return {
                 "fact_id": new_fact_id,
                 "status": "superseded",
-                "superseded": int(old_fact_id),
+                "superseded": safe_old_fact_id,
             }
 
         with _cross_process_write_lock(db_path):
@@ -342,19 +472,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             db_path = str(Path.home() / ".hermes" / "memory_store.db")
 
-    provider = mcp_provider.build_provider(
-        db_path=db_path,
-        hermes_src=args.hermes_src,
-        embedding_backend=args.embedding_backend,
-        ollama_url=args.ollama_url,
-        ollama_model=args.ollama_model,
-        embedding_prefix_policy=args.embedding_prefix_policy,
-        hrr_dim=args.hrr_dim,
-        dedup_jaccard=args.dedup_jaccard,
-        dedup_cosine=args.dedup_cosine,
-        busy_timeout_ms=args.busy_timeout_ms,
-        session_id="mcp-server",
-    )
+    try:
+        provider = mcp_provider.build_provider(
+            db_path=db_path,
+            hermes_src=args.hermes_src,
+            embedding_backend=args.embedding_backend,
+            ollama_url=args.ollama_url,
+            ollama_model=args.ollama_model,
+            embedding_prefix_policy=args.embedding_prefix_policy,
+            hrr_dim=args.hrr_dim,
+            dedup_jaccard=args.dedup_jaccard,
+            dedup_cosine=args.dedup_cosine,
+            busy_timeout_ms=args.busy_timeout_ms,
+            session_id="mcp-server",
+            read_only=args.read_only,
+        )
+    except RuntimeError as exc:
+        print(f"enfold MCP startup failed: {exc}", file=sys.stderr)
+        return 1
     try:
         server = build_server(provider, read_only=args.read_only)
         server.run(transport="stdio")

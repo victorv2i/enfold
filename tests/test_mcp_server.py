@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -181,6 +182,34 @@ def test_memory_search_parity_with_provider_search(mcp_server_mod, provider):
     ]
 
 
+def test_memory_search_rejects_non_string_query_before_provider_call(mcp_server_mod, provider):
+    def fail_search(*args, **kwargs):
+        raise AssertionError("invalid query reached provider.search")
+
+    provider.search = fail_search
+    server = mcp_server_mod.build_server(provider, read_only=False)
+    result = _content_json(_call(server, "memory_search", {
+        "query": 123, "limit": 5,
+    }))
+    assert result["error"] == "invalid query: must be a string"
+
+
+def test_memory_search_clamps_limit_before_provider_call(mcp_server_mod, provider):
+    seen = {}
+
+    def fake_search(query, limit=10, bump=True, **kwargs):
+        seen["limit"] = limit
+        return []
+
+    provider.search = fake_search
+    server = mcp_server_mod.build_server(provider, read_only=False)
+    result = _content_json(_call(server, "memory_search", {
+        "query": "Springfield", "limit": 500,
+    }))
+    assert result == {"results": [], "count": 0}
+    assert seen["limit"] == 50
+
+
 def test_memory_add_requires_source(mcp_server_mod, provider):
     """source has no default, so a missing value is rejected before the tool
     body even runs (FastMCP validates required args against the signature)."""
@@ -205,6 +234,41 @@ def test_memory_add_tags_source_and_persists(mcp_server_mod, provider):
         "SELECT tags FROM facts WHERE fact_id = ?", (fact_id,)
     ).fetchone()
     assert "source:claude-code" in row["tags"]
+
+
+def test_memory_add_strips_spoofed_source_tags(mcp_server_mod, provider):
+    server = mcp_server_mod.build_server(provider, read_only=False)
+    result = _content_json(_call(server, "memory_add", {
+        "content": "Alex Rivera's Springfield deploy owner is Morgan",
+        "category": "tool",
+        "source": "codex",
+        "tags": "owner, source:claude-code,source:other",
+    }))
+    assert result["status"] == "added"
+    row = provider._store._conn.execute(
+        "SELECT tags FROM facts WHERE fact_id = ?", (result["fact_id"],)
+    ).fetchone()
+    assert row["tags"] == "owner,source:codex"
+
+
+def test_memory_add_rejects_invalid_args_before_provider_call(mcp_server_mod, provider):
+    def fail_find(*args, **kwargs):
+        raise AssertionError("invalid content reached provider")
+
+    provider._find_near_duplicate = fail_find
+    server = mcp_server_mod.build_server(provider, read_only=False)
+    result = _content_json(_call(server, "memory_add", {
+        "content": "   ",
+        "source": "codex",
+    }))
+    assert result["error"] == "invalid content: must not be blank"
+
+    result = _content_json(_call(server, "memory_add", {
+        "content": "valid content",
+        "category": "x" * 129,
+        "source": "codex",
+    }))
+    assert result["error"] == "invalid category: exceeds 128 characters"
 
 
 def test_memory_add_rejects_invalid_source(mcp_server_mod, provider):
@@ -307,6 +371,28 @@ def test_memory_supersede_tool(mcp_server_mod, provider):
     assert new_id in active_ids
 
 
+def test_memory_supersede_rejects_unknown_old_fact_before_insert(mcp_server_mod, provider):
+    server = mcp_server_mod.build_server(provider, read_only=False)
+    result = _content_json(_call(server, "memory_supersede", {
+        "old_fact_id": 999999,
+        "new_content": "Alex Rivera's Springfield office is on the ninth floor",
+        "source": "other",
+    }))
+    assert result["error"] == "invalid old_fact_id: active fact not found"
+    count = provider._store._conn.execute("SELECT COUNT(*) AS c FROM facts").fetchone()["c"]
+    assert count == 0
+
+
+def test_memory_supersede_rejects_non_positive_old_fact_id(mcp_server_mod, provider):
+    server = mcp_server_mod.build_server(provider, read_only=False)
+    result = _content_json(_call(server, "memory_supersede", {
+        "old_fact_id": 0,
+        "new_content": "Alex Rivera's Springfield office is on the ninth floor",
+        "source": "other",
+    }))
+    assert result["error"] == "invalid old_fact_id: must be a positive integer"
+
+
 def test_memory_explain_matches_provider_explain_search(mcp_server_mod, provider):
     provider._store.add_fact(
         "Alex Rivera's Springfield build uses Skylark packaging", category="tool"
@@ -332,6 +418,19 @@ def test_readonly_server_rejects_write_tool_call(mcp_server_mod, provider):
             "content": "Alex Rivera's Springfield office is remote-first",
             "source": "codex",
         })
+
+
+def test_write_lock_uses_canonical_db_path(mcp_server_mod, tmp_path):
+    real_db = tmp_path / "real-facts.db"
+    real_db.touch()
+    db_path = tmp_path / "link-facts.db"
+    os.symlink(real_db, db_path)
+
+    with mcp_server_mod._cross_process_write_lock(str(db_path)):
+        pass
+
+    assert (tmp_path / "real-facts.db.mcp-write.lock").exists()
+    assert not (tmp_path / "link-facts.db.mcp-write.lock").exists()
 
 
 def test_concurrent_writers_no_lost_writes(mcp_provider, tmp_path):

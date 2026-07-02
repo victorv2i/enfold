@@ -50,10 +50,149 @@ def test_resolve_parent_modules_falls_back_to_fake_hermes(monkeypatch):
 
 
 def test_resolve_parent_modules_real_src_missing_falls_back(monkeypatch, tmp_path):
-    """A configured but nonexistent ENFOLD_HERMES_SRC falls back, doesn't raise."""
-    monkeypatch.setenv("ENFOLD_HERMES_SRC", str(tmp_path / "does-not-exist"))
+    """The default missing checkout falls back when no source is explicit."""
+    monkeypatch.delenv("ENFOLD_HERMES_SRC", raising=False)
+    monkeypatch.setattr(mcp_provider, "DEFAULT_HERMES_SRC", str(tmp_path / "does-not-exist"))
     used = mcp_provider.resolve_parent_modules()
     assert used == "fake_hermes"
+
+
+def test_explicit_missing_hermes_src_fails_closed(tmp_path):
+    import subprocess
+
+    missing_src = tmp_path / "does-not-exist"
+    code = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('mcpp', {str(_MCP_PROVIDER_PATH)!r})\n"
+        "mcpp = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mcpp)\n"
+        "mcpp.resolve_parent_modules(sys.argv[1])\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(missing_src)],
+        capture_output=True, text=True, timeout=15,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    assert result.returncode != 0
+    assert "explicit Hermes source" in result.stderr
+
+
+def test_real_parent_failure_restores_touched_sys_modules(monkeypatch, tmp_path):
+    src = tmp_path / "src"
+    holo_dir = src / "plugins" / "memory" / "holographic"
+    holo_dir.mkdir(parents=True)
+    (holo_dir / "holographic.py").write_text("raise RuntimeError('broken real parent')\n")
+    (holo_dir / "retrieval.py").write_text("class FactRetriever:\n    pass\n")
+    (holo_dir / "store.py").write_text("class MemoryStore:\n    pass\n")
+    (holo_dir / "__init__.py").write_text("class HolographicMemoryProvider:\n    pass\n")
+
+    removed = [
+        "agent", "agent.memory_manager", "plugins", "plugins.memory",
+        "plugins.memory.holographic", "plugins.memory.holographic.holographic",
+        "plugins.memory.holographic.retrieval", "plugins.memory.holographic.store",
+    ]
+    for name in removed:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    with pytest.raises(RuntimeError, match="explicit Hermes source"):
+        mcp_provider.resolve_parent_modules(str(src))
+
+    for name in removed:
+        assert name not in sys.modules
+
+
+def test_build_provider_canonicalizes_db_path(tmp_path, monkeypatch):
+    monkeypatch.delenv("ENFOLD_HERMES_SRC", raising=False)
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link_dir = tmp_path / "link"
+    os.symlink(real_dir, link_dir)
+
+    provider = mcp_provider.build_provider(
+        db_path=str(link_dir / "facts.db"),
+        embedding_backend="fake",
+        hrr_dim=64,
+    )
+    try:
+        assert os.path.realpath(str(provider._store.db_path)) == os.path.realpath(
+            str(real_dir / "facts.db")
+        )
+        assert str(provider._store.db_path) == os.path.realpath(str(real_dir / "facts.db"))
+    finally:
+        provider.shutdown()
+
+
+def test_read_only_provider_skips_mutating_initialize(tmp_path, monkeypatch):
+    monkeypatch.delenv("ENFOLD_HERMES_SRC", raising=False)
+    db_path = tmp_path / "facts.db"
+    writer = mcp_provider.build_provider(
+        db_path=str(db_path),
+        embedding_backend="fake",
+        hrr_dim=64,
+    )
+    try:
+        writer._store.add_fact("Alex Rivera keeps the Springfield runbook in Git", category="tool")
+    finally:
+        writer.shutdown()
+
+    def fail_initialize(*args, **kwargs):
+        raise AssertionError("read-only startup must not call provider.initialize")
+
+    monkeypatch.setattr(mcp_provider, "_initialize_with_retry", fail_initialize)
+    reader = mcp_provider.build_provider(
+        db_path=str(db_path),
+        embedding_backend="fake",
+        hrr_dim=64,
+        read_only=True,
+    )
+    try:
+        assert reader._queue_worker is None
+        assert reader._backfill_thread is None
+        assert reader.search("Springfield runbook", limit=5, bump=False)
+        with pytest.raises(sqlite3.OperationalError, match="readonly|read-only"):
+            reader._store._conn.execute(
+                "INSERT INTO facts (content, category) VALUES (?, ?)",
+                ("write should fail", "general"),
+            )
+    finally:
+        reader.shutdown()
+
+
+def test_explicit_env_hermes_src_import_failure_fails_closed(tmp_path):
+    import subprocess
+
+    src = tmp_path / "src"
+    holo_dir = src / "plugins" / "memory" / "holographic"
+    holo_dir.mkdir(parents=True)
+    (holo_dir / "holographic.py").write_text("raise RuntimeError('boom')\n")
+    (holo_dir / "retrieval.py").write_text("class FactRetriever:\n    pass\n")
+    (holo_dir / "store.py").write_text("class MemoryStore:\n    pass\n")
+    (holo_dir / "__init__.py").write_text("class HolographicMemoryProvider:\n    pass\n")
+
+    code = (
+        "import importlib.util\n"
+        f"spec = importlib.util.spec_from_file_location('mcpp', {str(_MCP_PROVIDER_PATH)!r})\n"
+        "mcpp = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mcpp)\n"
+        "mcpp.resolve_parent_modules()\n"
+    )
+    env = os.environ.copy()
+    env["ENFOLD_HERMES_SRC"] = str(src)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=15,
+        cwd=str(Path(__file__).resolve().parents[1]),
+        env=env,
+    )
+    assert result.returncode != 0
+    assert "explicit Hermes source" in result.stderr
+
+
+def test_resolve_parent_modules_explicit_real_src_missing_fails(monkeypatch, tmp_path):
+    """A configured nonexistent ENFOLD_HERMES_SRC fails closed."""
+    monkeypatch.setenv("ENFOLD_HERMES_SRC", str(tmp_path / "does-not-exist"))
+    with pytest.raises(RuntimeError, match="explicit Hermes source"):
+        mcp_provider.resolve_parent_modules()
 
 
 def test_build_provider_uses_configurable_db_path(tmp_path, monkeypatch):
