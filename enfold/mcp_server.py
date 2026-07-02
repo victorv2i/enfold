@@ -50,19 +50,13 @@ entirely, which is why every example here uses the file path.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import importlib.util
 import logging
 import sqlite3
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, TypeVar
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - posix-only; this server targets Linux
-    fcntl = None
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 _THIS_DIR = Path(__file__).resolve().parent
 
@@ -86,6 +80,20 @@ def _load_mcp_provider():
 
 mcp_provider = _load_mcp_provider()
 
+
+def _load_write_lock():
+    name = "_enfold_write_lock"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, _THIS_DIR / "write_lock.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_cross_process_write_lock = _load_write_lock().cross_process_write_lock
+
 try:
     from mcp.server.fastmcp import FastMCP
 except ImportError as exc:  # pragma: no cover - exercised only without the dep
@@ -107,41 +115,6 @@ MAX_LIMIT = 50
 
 _T = TypeVar("_T")
 logger = logging.getLogger(__name__)
-
-
-@contextlib.contextmanager
-def _cross_process_write_lock(db_path: str) -> Iterator[None]:
-    """Serialize writers across separate MCP server processes sharing db_path.
-
-    A enfold write (dedup search, insert, HRR bank rebuild,
-    optional supersession) is several separate short SQLite transactions,
-    not one. SQLite's own busy_timeout retries a single blocked statement,
-    but it cannot make that whole multi-statement sequence atomic across two
-    processes: one process can complete its INSERT, then have its bank
-    rebuild collide with another process's INSERT, and so on, so contention
-    compounds instead of just queueing once. An OS advisory lock (flock) on
-    a sidecar file next to db_path makes each MCP write fully serialized
-    with any other process's write to the *same* db, which is what actually
-    eliminates SQLITE_BUSY here (verified: without this lock, two processes
-    each adding 25 facts to a fresh db occasionally exhaust a 30-attempt
-    exponential backoff and still fail).
-
-    A no-op within a single process across threads (RLock in fake_hermes/
-    the real store already serializes those); this only matters once there
-    are two separate OS processes, which is the deployment shape multiple
-    MCP server instances (Claude Code, Codex CLI, ...) actually have.
-    """
-    if fcntl is None:  # pragma: no cover - posix-only
-        yield
-        return
-    lock_path = f"{Path(db_path).expanduser().resolve()}.mcp-write.lock"
-    fh = open(lock_path, "a+")
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        fh.close()
 
 
 def _retry_on_locked(fn: Callable[[], _T], attempts: int = 30, base_delay: float = 0.02) -> _T:

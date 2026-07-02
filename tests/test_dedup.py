@@ -48,9 +48,16 @@ def test_distinct_facts_are_not_duplicates():
 
 
 def test_value_tokens_and_content_tokens():
-    assert _value_tokens("port 3100 sha abc123") == {"3100", "abc123"}
-    assert _value_tokens("no values here") == set()
+    assert _value_tokens("port 3100 sha abc123") == ("3100", "abc123")
+    assert _value_tokens("no values here") == ()
     assert _content_tokens("the port is on a host") == {"port", "host"}
+
+
+def test_swapped_value_sequence_is_not_a_duplicate():
+    a = "The primary port is 3100 and the fallback port is 3200."
+    b = "The primary port is 3200 and the fallback port is 3100."
+    assert _is_near_duplicate(a, b, 0.9) is False
+    assert _is_semantic_duplicate(a, b, 0.99, 0.92) is False
 
 
 def test_blend_score_dense_term_not_trust_weighted():
@@ -66,6 +73,12 @@ def test_semantic_duplicate_antonym_flip_is_kept():
     # (active -> archived) a duplicate. This is an UPDATE and must be kept.
     a = "The LDI Canvas sandbox service is currently active"
     b = "The LDI Canvas sandbox service is currently archived"
+    assert _is_semantic_duplicate(a, b, 0.99, 0.92) is False
+
+
+def test_semantic_duplicate_low_jaccard_state_flip_is_kept():
+    a = "The service timer is enabled for restart automation."
+    b = "Automatic restarts are disabled now."
     assert _is_semantic_duplicate(a, b, 0.99, 0.92) is False
 
 

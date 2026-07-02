@@ -149,7 +149,7 @@ def test_insert_facts_skips_bad_rows_keeps_rest():
         return original_add(content, category=category, tags=tags)
 
     store.add_fact = flaky_add
-    inserted = insert_facts(
+    result = insert_facts(
         store,
         [
             {"content": "a good durable fact", "category": "general", "tags": ""},
@@ -157,7 +157,9 @@ def test_insert_facts_skips_bad_rows_keeps_rest():
             {"content": "another good fact", "category": "tool", "tags": "x"},
         ],
     )
-    assert inserted == 2
+    assert result.inserted == 2
+    assert result.skipped == 0
+    assert result.failed == 1
     assert len(store.added) == 2
 
 

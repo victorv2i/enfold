@@ -3,6 +3,8 @@
 import threading
 import time
 
+import fake_hermes
+
 MESSAGES = [
     {"role": "user", "content": "I always use pnpm for node projects, remember that."},
     {"role": "assistant", "content": "Noted, pnpm is your package manager of choice."},
@@ -106,6 +108,56 @@ def test_backfill_checks_stop_event_per_chunk(make_provider, waiter):
 
     provider._backfill_embeddings(threading.Event())
     assert embedding_count() == 1
+
+
+def test_stale_embed_task_after_reinit_does_not_write_new_store(hp, tmp_path, waiter):
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingEmbedder(fake_hermes.FakeEmbedder):
+        def embed(self, text):
+            started.set()
+            release.wait(10.0)
+            return super().embed(text)
+
+    class UnavailableEmbedder(fake_hermes.FakeEmbedder):
+        def is_available(self):
+            return False
+
+    blocking_embedder = BlockingEmbedder()
+    embedders = [blocking_embedder, UnavailableEmbedder()]
+
+    class TestProvider(hp.EnfoldProvider):
+        def _create_embedder(self):
+            return embedders.pop(0)
+
+    provider = TestProvider(config={
+        "db_path": str(tmp_path / "facts.db"),
+        "hrr_dim": 64,
+    })
+    provider.initialize("first-session")
+    assert waiter(lambda: not provider._backfill_thread.is_alive())
+
+    fact_id = provider._store.add_fact(
+        "The stale embed task should not write after reinit.",
+        category="general",
+    )
+    provider._submit_embed(
+        provider._embed_and_store,
+        fact_id,
+        "The stale embed task should not write after reinit.",
+    )
+    assert waiter(started.is_set)
+
+    provider.initialize("second-session")
+    release.set()
+    assert waiter(lambda: len(blocking_embedder.embed_calls) == 1)
+    embedding_count = provider._store._conn.execute(
+        "SELECT COUNT(*) FROM fact_embeddings"
+    ).fetchone()[0]
+    assert embedding_count == 0
+
+    provider.shutdown()
 
 
 def test_shutdown_stops_worker(make_provider):

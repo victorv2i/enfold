@@ -9,6 +9,9 @@ by default, temporal_filter=false preserves old behaviour, and the legacy
 string-prefix filter still works alongside structural supersession.
 """
 
+import contextlib
+import logging
+from pathlib import Path
 import sqlite3
 import threading
 
@@ -159,7 +162,13 @@ def test_identical_values_is_not_a_value_update():
 def test_no_value_tokens_is_not_a_value_update():
     a = "The Skylark sandbox service is currently active."
     b = "The Skylark sandbox service is currently archived."
-    assert _is_value_update(b, a) is False
+    assert _is_value_update(b, a) is True
+
+
+def test_low_jaccard_state_change_is_a_value_update():
+    a = "The Springfield timer is enabled for restart automation."
+    b = "Automatic restarts are disabled now for Springfield."
+    assert _is_value_update(b, a) is True
 
 
 def test_unrelated_fact_is_not_a_value_update():
@@ -225,6 +234,36 @@ def test_supersede_is_idempotent_and_does_not_overwrite_an_existing_link():
         "SELECT superseded_by FROM facts WHERE fact_id = ?", (a,)
     ).fetchone()
     assert row["superseded_by"] == b
+
+
+def test_supersede_reports_noop_and_logs_when_old_row_is_not_active(caplog):
+    conn = _conn()
+    ensure_temporal_schema(conn)
+    a = _add(conn, "v1")
+    b = _add(conn, "v2")
+    c = _add(conn, "v3")
+
+    assert supersede(conn, a, b) is True
+    caplog.set_level(logging.DEBUG, logger="enfold.temporal")
+
+    assert supersede(conn, a, c) is False
+
+    row = conn.execute(
+        "SELECT superseded_by FROM facts WHERE fact_id = ?", (a,)
+    ).fetchone()
+    assert row["superseded_by"] == b
+    assert "supersede no-op" in caplog.text
+
+
+def test_cross_process_write_lock_is_reentrant_for_same_db_path(hp, tmp_path):
+    db_path = tmp_path / "facts.db"
+    db_path.touch()
+
+    with hp.cross_process_write_lock(str(db_path)):
+        with hp.cross_process_write_lock(str(db_path)):
+            pass
+
+    assert (tmp_path / "facts.db.mcp-write.lock").exists()
 
 
 def test_fact_history_returns_full_chain_from_any_link():
@@ -295,6 +334,94 @@ def test_interactive_add_of_a_value_update_supersedes_the_old_fact(make_provider
     ).fetchone()
     assert old_row["invalid_at"] is not None
     assert old_row["superseded_by"] == new_id
+
+
+def test_interactive_add_of_a_state_update_supersedes_the_old_fact(make_provider):
+    import json
+
+    provider = make_provider()
+    add_result = json.loads(provider._handle_fact_store({
+        "action": "add",
+        "content": "The Skylark sandbox service is currently active.",
+        "category": "project",
+    }))
+    old_id = add_result["fact_id"]
+
+    update_result = json.loads(provider._handle_fact_store({
+        "action": "add",
+        "content": "The Skylark sandbox service is currently archived.",
+        "category": "project",
+    }))
+    assert update_result["status"] == "added"
+    new_id = update_result["fact_id"]
+
+    old_row = provider._store._conn.execute(
+        "SELECT invalid_at, superseded_by FROM facts WHERE fact_id = ?", (old_id,)
+    ).fetchone()
+    assert old_row["invalid_at"] is not None
+    assert old_row["superseded_by"] == new_id
+
+
+def test_interactive_add_holds_write_lock_through_supersede(make_provider, hp, monkeypatch):
+    import json
+
+    provider = make_provider()
+    lock_depth = 0
+    events = []
+    expected_db = str(Path(provider._store.db_path).expanduser().resolve())
+
+    @contextlib.contextmanager
+    def fake_lock(db_path):
+        nonlocal lock_depth
+        events.append(("enter", db_path))
+        assert db_path == expected_db
+        lock_depth += 1
+        try:
+            yield
+        finally:
+            lock_depth -= 1
+            events.append(("exit", db_path))
+
+    monkeypatch.setattr(hp, "cross_process_write_lock", fake_lock, raising=False)
+
+    original_dedup = provider._find_near_duplicate
+    original_update = provider._find_update_target
+    original_supersede = provider._supersede_fact
+
+    def checked_dedup(*args, **kwargs):
+        assert lock_depth == 1
+        events.append(("dedup", None))
+        return original_dedup(*args, **kwargs)
+
+    def checked_update(*args, **kwargs):
+        assert lock_depth == 1
+        events.append(("update", None))
+        return original_update(*args, **kwargs)
+
+    def checked_supersede(*args, **kwargs):
+        assert lock_depth == 1
+        events.append(("supersede", None))
+        return original_supersede(*args, **kwargs)
+
+    monkeypatch.setattr(provider, "_find_near_duplicate", checked_dedup)
+    monkeypatch.setattr(provider, "_find_update_target", checked_update)
+    monkeypatch.setattr(provider, "_supersede_fact", checked_supersede)
+
+    first = json.loads(provider._handle_fact_store({
+        "action": "add",
+        "content": "The Skylark dashboard port is 3100.",
+        "category": "project",
+    }))
+    second = json.loads(provider._handle_fact_store({
+        "action": "add",
+        "content": "The Skylark dashboard port is 3200.",
+        "category": "project",
+    }))
+
+    assert first["status"] == "added"
+    assert second["status"] == "added"
+    assert ("supersede", None) in events
+    assert events.count(("enter", expected_db)) == 2
 
 
 def test_search_excludes_superseded_facts_by_default(make_provider):
@@ -408,3 +535,74 @@ def test_extraction_insert_supersedes_a_value_update(make_provider, aux_module, 
     facts = provider._store.list_facts(min_trust=0.0, limit=50)
     contents = [f["content"] for f in facts]
     assert "The Skylark dashboard port is 3200." in contents
+
+
+def test_extraction_insert_batch_uses_cross_process_write_lock(
+    make_provider, hp, monkeypatch, aux_module, waiter
+):
+    import json
+    import types
+
+    lock_events = []
+
+    @contextlib.contextmanager
+    def fake_lock(db_path):
+        lock_events.append(("enter", db_path))
+        try:
+            yield
+        finally:
+            lock_events.append(("exit", db_path))
+
+    monkeypatch.setattr(hp, "cross_process_write_lock", fake_lock, raising=False)
+    provider = make_provider(extraction_provider="testprov", extraction_model="testmodel")
+    old_id = provider._store.add_fact(
+        "The Skylark dashboard port is 3100.", category="project"
+    )
+
+    aux_module.call_llm = lambda **kwargs: types.SimpleNamespace(
+        choices=[types.SimpleNamespace(message=types.SimpleNamespace(
+            content=json.dumps([{
+                "content": "The Skylark dashboard port is 3200.",
+                "category": "project", "tags": "skylark,port",
+            }]),
+        ))]
+    )
+
+    provider.on_session_end([
+        {"role": "user", "content": "The Skylark dashboard port changed to 3200."},
+        {"role": "assistant", "content": "Updated, the port is now 3200."},
+    ])
+
+    assert waiter(lambda: provider._extract_queue.pending_count() == 0)
+    assert lock_events
+    assert lock_events[0][0] == "enter"
+    assert lock_events[-1][0] == "exit"
+
+    old_row = provider._store._conn.execute(
+        "SELECT superseded_by FROM facts WHERE fact_id = ?", (old_id,)
+    ).fetchone()
+    assert old_row["superseded_by"] is not None
+
+
+def test_reflection_insert_uses_cross_process_write_lock(make_provider, hp, monkeypatch):
+    lock_events = []
+
+    @contextlib.contextmanager
+    def fake_lock(db_path):
+        lock_events.append(("enter", db_path))
+        try:
+            yield
+        finally:
+            lock_events.append(("exit", db_path))
+
+    monkeypatch.setattr(hp, "cross_process_write_lock", fake_lock, raising=False)
+    provider = make_provider()
+
+    fact_id = provider._insert_reflection_fact(
+        "Alex Rivera prefers async status updates.",
+        category="insight",
+        tags="source_facts:1,2",
+    )
+
+    assert fact_id
+    assert [event[0] for event in lock_events] == ["enter", "exit"]

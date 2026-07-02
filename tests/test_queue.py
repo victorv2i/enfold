@@ -54,8 +54,52 @@ def test_enqueue_and_fifo_pending(raw_queue):
     row = raw_queue.next_pending(max_attempts=5)
     assert row["id"] == first
     assert row["payload"] == "payload one"
-    raw_queue.mark_done(first)
+    raw_queue.mark_done(first, row["lease_owner"])
     assert raw_queue.next_pending(max_attempts=5)["id"] == second
+
+
+def test_next_pending_claims_row_with_lease(raw_queue):
+    row_id = raw_queue.enqueue("payload one")
+
+    first = raw_queue.next_pending(max_attempts=5, lease_owner="worker-a")
+    second = raw_queue.next_pending(max_attempts=5, lease_owner="worker-b")
+
+    assert first["id"] == row_id
+    assert first["lease_owner"] == "worker-a"
+    assert first["lease_until"] > time.time()
+    assert second is None
+    stored = raw_queue._conn.execute(
+        "SELECT status, lease_owner, lease_until FROM extract_queue WHERE id = ?",
+        (row_id,),
+    ).fetchone()
+    assert stored[0] == "processing"
+    assert stored[1] == "worker-a"
+    assert stored[2] == first["lease_until"]
+
+
+def test_expired_processing_lease_is_reclaimable(raw_queue):
+    row_id = raw_queue.enqueue("payload one")
+    first = raw_queue.next_pending(
+        max_attempts=5, lease_owner="worker-a", lease_seconds=0.01
+    )
+    assert first["id"] == row_id
+    time.sleep(0.02)
+
+    reclaimed = raw_queue.next_pending(max_attempts=5, lease_owner="worker-b")
+
+    assert reclaimed["id"] == row_id
+    assert reclaimed["lease_owner"] == "worker-b"
+    assert reclaimed["attempts"] == 0
+
+
+def test_mark_done_requires_matching_lease_owner(raw_queue):
+    row_id = raw_queue.enqueue("payload one")
+    raw_queue.next_pending(max_attempts=5, lease_owner="worker-a")
+
+    assert raw_queue.mark_done(row_id, "worker-b") is False
+    assert raw_queue.pending_count() == 1
+    assert raw_queue.mark_done(row_id, "worker-a") is True
+    assert raw_queue.pending_count() == 0
 
 
 def test_payload_capped_to_12kb_keeping_tail(hp, raw_queue):
@@ -70,10 +114,19 @@ def test_payload_capped_to_12kb_keeping_tail(hp, raw_queue):
 
 def test_mark_failed_increments_and_marks_dead(raw_queue):
     row_id = raw_queue.enqueue("doomed payload")
-    assert raw_queue.mark_failed(row_id, "boom 1", max_attempts=3) == 1
-    assert raw_queue.mark_failed(row_id, "boom 2", max_attempts=3) == 2
+    row = raw_queue.next_pending(max_attempts=3)
+    assert raw_queue.mark_failed(
+        row_id, "boom 1", max_attempts=3, lease_owner=row["lease_owner"]
+    ) == 1
+    row = raw_queue.next_pending(max_attempts=3)
+    assert raw_queue.mark_failed(
+        row_id, "boom 2", max_attempts=3, lease_owner=row["lease_owner"]
+    ) == 2
     assert raw_queue.pending_count() == 1
-    assert raw_queue.mark_failed(row_id, "boom 3", max_attempts=3) == 3
+    row = raw_queue.next_pending(max_attempts=3)
+    assert raw_queue.mark_failed(
+        row_id, "boom 3", max_attempts=3, lease_owner=row["lease_owner"]
+    ) == 3
     assert raw_queue.pending_count() == 0
     assert raw_queue.dead_count() == 1
     assert raw_queue.next_pending(max_attempts=3) is None
@@ -190,7 +243,7 @@ def test_in_memory_attempt_bound_when_mark_failed_is_broken(make_provider, aux_m
     provider._queue_max_attempts = 2
     provider.initialize("test-session")
 
-    def broken_mark_failed(row_id, error, max_attempts):
+    def broken_mark_failed(row_id, error, max_attempts, **kwargs):
         raise sqlite3.OperationalError("disk I/O error")
 
     provider._extract_queue.mark_failed = broken_mark_failed
@@ -301,8 +354,11 @@ def test_shutdown_interrupted_extraction_stays_pending(make_provider, aux_module
     provider._drain_extract_queue(stop, provider._extract_queue)
 
     row = provider._extract_queue._conn.execute(
-        "SELECT status, attempts FROM extract_queue WHERE id = ?", (row_id,)
+        "SELECT status, attempts, lease_owner, lease_until FROM extract_queue WHERE id = ?",
+        (row_id,),
     ).fetchone()
     assert row[0] == "pending", "shutdown-interrupted row must stay pending"
     assert row[1] == 0, "a shutdown interruption must not consume a retry attempt"
+    assert row[2] is None
+    assert row[3] is None
     assert provider._extract_queue.dead_count() == 0

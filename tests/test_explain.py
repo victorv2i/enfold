@@ -12,6 +12,7 @@ import json
 import subprocess
 import sys
 
+import numpy as np
 import pytest
 
 
@@ -79,6 +80,52 @@ def test_explain_search_respects_limit_on_included_results(make_provider):
     explained = provider.explain_search("Skylark testing", limit=2)
     included = [r for r in explained if r["excluded"] is None]
     assert len(included) <= 2
+
+
+def test_dense_candidates_filter_before_truncation(make_provider):
+    provider = make_provider(embedding_weight=1.0)
+    query = "needleprobe"
+    qvec = np.asarray([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    provider._fake_embedder.table[query] = qvec
+
+    invalid_ids = []
+    for i, vec in enumerate((
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.99, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )):
+        fact_id = provider._store.add_fact(
+            f"Retired vector candidate number {i}.", category="general"
+        )
+        invalid_ids.append(fact_id)
+        provider._embed_store.upsert(
+            fact_id,
+            np.asarray(vec, dtype=np.float32),
+            embedding_identity=provider._embedding_identity("document"),
+        )
+        provider._store._conn.execute(
+            "UPDATE facts SET invalid_at = CURRENT_TIMESTAMP WHERE fact_id = ?",
+            (fact_id,),
+        )
+
+    valid_id = provider._store.add_fact(
+        "Live vector candidate survives the embedding window.", category="general"
+    )
+    provider._embed_store.upsert(
+        valid_id,
+        np.asarray([0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        embedding_identity=provider._embedding_identity("document"),
+    )
+    provider._store._conn.commit()
+
+    results = provider.search(query, min_trust=0.0, limit=1, bump=False)
+    assert [r["fact_id"] for r in results] == [valid_id]
+
+    explained = provider.search(query, min_trust=0.0, limit=1, bump=False, explain=True)
+    included = [r for r in explained if r["excluded"] is None]
+    excluded = {r["fact_id"]: r["excluded"] for r in explained if r["excluded"]}
+    assert [r["fact_id"] for r in included] == [valid_id]
+    assert excluded[invalid_ids[0]] == "temporally_invalid"
+    assert excluded[invalid_ids[1]] == "temporally_invalid"
 
 
 def test_cli_smoke_prints_breakdown(tmp_path, hp):

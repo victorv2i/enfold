@@ -38,3 +38,24 @@ def test_facts_without_embeddings_cannot_earn_the_embedding_slice(hp):
     without_emb = hp._blend_score(0.4, None, ew)
     assert with_emb > without_emb
     assert without_emb == pytest.approx(0.7 * 0.4)
+
+
+def test_embedding_weight_is_clamped_to_unit_interval(make_provider, caplog):
+    caplog.set_level("WARNING", logger="enfold")
+    high = make_provider(embedding_weight=1.2)
+    low = make_provider(embedding_weight=-0.4)
+
+    assert high._embed_weight == pytest.approx(1.0)
+    assert low._embed_weight == pytest.approx(0.0)
+    assert "clamped embedding_weight" in caplog.text
+
+
+def test_negative_holographic_weights_are_clamped(make_provider, caplog):
+    caplog.set_level("WARNING", logger="enfold")
+    provider = make_provider(fts_weight=-0.5, jaccard_weight=0.2, hrr_weight=0.3)
+    r = provider._retriever
+
+    assert r.fts_weight == pytest.approx(0.0)
+    assert r.jaccard_weight == pytest.approx(0.4)
+    assert r.hrr_weight == pytest.approx(0.6)
+    assert "clamped holographic retrieval weights" in caplog.text

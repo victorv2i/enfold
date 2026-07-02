@@ -26,6 +26,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from typing import Any, Dict, Iterable, Optional
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 MAX_PAYLOAD_BYTES = 12 * 1024
 
 STATUS_PENDING = "pending"
+STATUS_PROCESSING = "processing"
 STATUS_DEAD = "dead"
 
 # Failure messages matching any of these substrings (case-insensitive) are
@@ -99,7 +101,9 @@ CREATE TABLE IF NOT EXISTS extract_queue (
     attempts   INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     status     TEXT NOT NULL DEFAULT 'pending',
-    not_before REAL
+    not_before REAL,
+    lease_owner TEXT,
+    lease_until REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_extract_queue_status
@@ -121,11 +125,11 @@ class ExtractQueue:
         self._lock = lock if lock is not None else threading.RLock()
         with self._lock:
             self._conn.executescript(_SCHEMA)
-            self._ensure_not_before_column()
+            self._ensure_columns()
             self._conn.commit()
 
-    def _ensure_not_before_column(self) -> None:
-        """Lazy migration: add not_before to tables created before quota retries.
+    def _ensure_columns(self) -> None:
+        """Lazy migration for additive queue columns.
 
         Mirrors EmbedStore's migration style: a PRAGMA table_info guard, then
         a single ALTER TABLE ... ADD COLUMN. Idempotent and safe on every
@@ -133,9 +137,15 @@ class ExtractQueue:
         """
         info = self._conn.execute("PRAGMA table_info(extract_queue)").fetchall()
         cols = {row[1] for row in info}
-        if "not_before" not in cols:
+        for name, decl in (
+            ("not_before", "REAL"),
+            ("lease_owner", "TEXT"),
+            ("lease_until", "REAL"),
+        ):
+            if name in cols:
+                continue
             try:
-                self._conn.execute("ALTER TABLE extract_queue ADD COLUMN not_before REAL")
+                self._conn.execute(f"ALTER TABLE extract_queue ADD COLUMN {name} {decl}")
             except sqlite3.OperationalError as exc:
                 # Two processes racing this same check-then-add on a fresh db
                 # (e.g. two MCP server instances starting at once): the
@@ -170,13 +180,29 @@ class ExtractQueue:
             self._conn.commit()
             return int(cur.lastrowid)
 
-    def mark_done(self, row_id: int) -> None:
-        """Delete a successfully processed row."""
-        with self._lock:
-            self._conn.execute("DELETE FROM extract_queue WHERE id = ?", (row_id,))
-            self._conn.commit()
+    def mark_done(self, row_id: int, lease_owner: Optional[str] = None) -> bool:
+        """Delete a successfully processed row.
 
-    def mark_failed(self, row_id: int, error: str, max_attempts: int) -> int:
+        Claimed rows may only be completed by their current lease owner.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                DELETE FROM extract_queue
+                WHERE id = ? AND status = ? AND lease_owner = ?
+                """,
+                (row_id, STATUS_PROCESSING, lease_owner),
+            )
+            self._conn.commit()
+            return int(cur.rowcount) == 1
+
+    def mark_failed(
+        self,
+        row_id: int,
+        error: str,
+        max_attempts: int,
+        lease_owner: Optional[str] = None,
+    ) -> int:
         """Record a failed attempt; mark the row dead once attempts reach the cap.
 
         Rows past MAX_ROW_AGE_SECONDS are marked dead regardless of the
@@ -186,10 +212,15 @@ class ExtractQueue:
         """
         with self._lock:
             row = self._conn.execute(
-                "SELECT attempts, strftime('%s', created_at) FROM extract_queue WHERE id = ?",
+                """
+                SELECT attempts, strftime('%s', created_at), status, lease_owner
+                FROM extract_queue WHERE id = ?
+                """,
                 (row_id,),
             ).fetchone()
             if row is None:
+                return 0
+            if row[2] != STATUS_PROCESSING or row[3] != lease_owner:
                 return 0
             attempts = int(row[0]) + 1
             message = (error or "")[:500]
@@ -201,7 +232,8 @@ class ExtractQueue:
             self._conn.execute(
                 """
                 UPDATE extract_queue
-                SET attempts = ?, last_error = ?, status = ?
+                SET attempts = ?, last_error = ?, status = ?,
+                    lease_owner = NULL, lease_until = NULL
                 WHERE id = ?
                 """,
                 (attempts, message, status, row_id),
@@ -209,7 +241,13 @@ class ExtractQueue:
             self._conn.commit()
             return attempts
 
-    def mark_quota_failed(self, row_id: int, error: str, not_before: float) -> bool:
+    def mark_quota_failed(
+        self,
+        row_id: int,
+        error: str,
+        not_before: float,
+        lease_owner: Optional[str] = None,
+    ) -> bool:
         """Reschedule a quota-limited row without consuming a retry attempt.
 
         The row stays pending and next_pending() skips it until *not_before*
@@ -221,17 +259,23 @@ class ExtractQueue:
         """
         with self._lock:
             row = self._conn.execute(
-                "SELECT strftime('%s', created_at) FROM extract_queue WHERE id = ?",
+                """
+                SELECT strftime('%s', created_at), status, lease_owner
+                FROM extract_queue WHERE id = ?
+                """,
                 (row_id,),
             ).fetchone()
             if row is None:
+                return False
+            if row[1] != STATUS_PROCESSING or row[2] != lease_owner:
                 return False
             message = (error or "")[:500]
             if self._age_exceeded(row[0]):
                 self._conn.execute(
                     """
                     UPDATE extract_queue
-                    SET last_error = ?, status = ?, not_before = NULL
+                    SET last_error = ?, status = ?, not_before = NULL,
+                        lease_owner = NULL, lease_until = NULL
                     WHERE id = ?
                     """,
                     (message + _AGE_CAP_NOTE, STATUS_DEAD, row_id),
@@ -239,11 +283,30 @@ class ExtractQueue:
                 self._conn.commit()
                 return False
             self._conn.execute(
-                "UPDATE extract_queue SET last_error = ?, not_before = ? WHERE id = ?",
-                (message, float(not_before), row_id),
+                """
+                UPDATE extract_queue
+                SET last_error = ?, not_before = ?, status = ?,
+                    lease_owner = NULL, lease_until = NULL
+                WHERE id = ?
+                """,
+                (message, float(not_before), STATUS_PENDING, row_id),
             )
             self._conn.commit()
             return True
+
+    def release_claim(self, row_id: int, lease_owner: str) -> bool:
+        """Return a claimed row to pending without consuming an attempt."""
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE extract_queue
+                SET status = ?, lease_owner = NULL, lease_until = NULL
+                WHERE id = ? AND status = ? AND lease_owner = ?
+                """,
+                (STATUS_PENDING, row_id, STATUS_PROCESSING, lease_owner),
+            )
+            self._conn.commit()
+            return int(cur.rowcount) == 1
 
     def revive_dead(self, ids: Optional[Iterable[int]] = None) -> int:
         """Reset dead rows to pending so the worker retries them.
@@ -257,6 +320,7 @@ class ExtractQueue:
         sql = """
             UPDATE extract_queue
             SET status = ?, attempts = 0, not_before = NULL,
+                lease_owner = NULL, lease_until = NULL,
                 last_error = COALESCE(last_error, '') || ' (revived)'
             WHERE status = ?
         """
@@ -301,24 +365,37 @@ class ExtractQueue:
     # ------------------------------------------------------------------
 
     def next_pending(
-        self, max_attempts: int, exclude_ids=()
+        self,
+        max_attempts: int,
+        exclude_ids=(),
+        lease_owner: Optional[str] = None,
+        lease_seconds: float = 600.0,
     ) -> Optional[Dict[str, Any]]:
-        """Return the oldest due pending row as a dict, or None when drained.
+        """Claim and return the oldest due row, or None when drained.
 
         Rows whose not_before is in the future (quota reschedules) are
         skipped until due. Rows whose id is in *exclude_ids* are skipped; the
         worker uses this as an in-memory bound when recording failures in the
         DB is broken.
 
+        Expired processing leases are eligible to be claimed by a new owner.
+
         Index-based row access so this works with any row_factory.
         """
         exclude = [int(i) for i in exclude_ids]
+        owner = lease_owner or f"{threading.get_ident()}-{uuid.uuid4().hex}"
+        now = time.time()
+        lease_until = now + float(lease_seconds)
         sql = """
-            SELECT id, payload, attempts FROM extract_queue
-            WHERE status = ? AND attempts < ?
+            SELECT id FROM extract_queue
+            WHERE attempts < ?
               AND (not_before IS NULL OR not_before <= ?)
+              AND (
+                    status = ?
+                    OR (status = ? AND lease_until IS NOT NULL AND lease_until <= ?)
+                  )
         """
-        params: list = [STATUS_PENDING, max_attempts, time.time()]
+        params: list = [max_attempts, now, STATUS_PENDING, STATUS_PROCESSING, now]
         if exclude:
             placeholders = ",".join("?" * len(exclude))
             sql += f" AND id NOT IN ({placeholders})"
@@ -326,16 +403,60 @@ class ExtractQueue:
         sql += " ORDER BY id LIMIT 1"
         with self._lock:
             row = self._conn.execute(sql, params).fetchone()
-        if row is None:
+            if row is None:
+                return None
+            row_id = int(row[0])
+            cur = self._conn.execute(
+                """
+                UPDATE extract_queue
+                SET status = ?, lease_owner = ?, lease_until = ?
+                WHERE id = ?
+                  AND attempts < ?
+                  AND (not_before IS NULL OR not_before <= ?)
+                  AND (
+                        status = ?
+                        OR (status = ? AND lease_until IS NOT NULL AND lease_until <= ?)
+                      )
+                """,
+                (
+                    STATUS_PROCESSING,
+                    owner,
+                    lease_until,
+                    row_id,
+                    max_attempts,
+                    now,
+                    STATUS_PENDING,
+                    STATUS_PROCESSING,
+                    now,
+                ),
+            )
+            if int(cur.rowcount) != 1:
+                self._conn.rollback()
+                return None
+            claimed = self._conn.execute(
+                """
+                SELECT id, payload, attempts, lease_owner, lease_until
+                FROM extract_queue WHERE id = ?
+                """,
+                (row_id,),
+            ).fetchone()
+            self._conn.commit()
+        if claimed is None:
             return None
-        return {"id": int(row[0]), "payload": row[1], "attempts": int(row[2])}
+        return {
+            "id": int(claimed[0]),
+            "payload": claimed[1],
+            "attempts": int(claimed[2]),
+            "lease_owner": claimed[3],
+            "lease_until": float(claimed[4]),
+        }
 
     def pending_count(self) -> int:
-        """Number of rows still waiting to be processed."""
+        """Number of rows still not terminal."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT COUNT(*) FROM extract_queue WHERE status = ?",
-                (STATUS_PENDING,),
+                "SELECT COUNT(*) FROM extract_queue WHERE status IN (?, ?)",
+                (STATUS_PENDING, STATUS_PROCESSING),
             ).fetchone()
         return int(row[0])
 

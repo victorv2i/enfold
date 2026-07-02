@@ -41,7 +41,7 @@ def test_insert_facts_skips_near_duplicate_of_existing_fact(make_provider):
         category="tool",
     )
 
-    inserted = insert_facts(
+    result = insert_facts(
         provider._store,
         [{
             "content": "The user prefers pnpm as their package manager for node projects.",
@@ -51,7 +51,9 @@ def test_insert_facts_skips_near_duplicate_of_existing_fact(make_provider):
         dedup_check=provider._find_near_duplicate,
     )
 
-    assert inserted == 0
+    assert result.inserted == 0
+    assert result.skipped == 1
+    assert result.failed == 0
     facts = provider._store.list_facts(min_trust=0.0, limit=50)
     assert len(facts) == 1, "the verbatim restatement must not be stored again"
 
@@ -78,6 +80,42 @@ def test_queue_drain_dedupes_extracted_facts_against_existing_store(
     assert waiter(lambda: provider._extract_queue.pending_count() == 0)
     facts = provider._store.list_facts(min_trust=0.0, limit=50)
     assert len(facts) == 1, "extraction must not duplicate a fact already in the store"
+
+
+def test_queue_drain_retries_when_fact_insert_fails(make_provider, aux_module):
+    provider = make_provider(**_extraction_cfg())
+    provider._queue_max_attempts = 3
+    provider._extract_drain_batch = 1
+    aux_module.call_llm = lambda **kwargs: _llm_response(json.dumps([
+        {"content": "The storage failure should keep the queue item retryable.",
+         "category": "general", "tags": "storage"},
+    ]))
+
+    def locked_add_fact(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    provider._store.add_fact = locked_add_fact
+    row_id = provider._extract_queue.enqueue("USER: a transcript that extracts one fact")
+
+    import threading
+    stop = threading.Event()
+    original_mark_failed = provider._extract_queue.mark_failed
+
+    def mark_failed_once(*args, **kwargs):
+        attempts = original_mark_failed(*args, **kwargs)
+        stop.set()
+        return attempts
+
+    provider._extract_queue.mark_failed = mark_failed_once
+    provider._drain_extract_queue(stop, provider._extract_queue)
+
+    row = provider._store._conn.execute(
+        "SELECT status, attempts, last_error FROM extract_queue WHERE id = ?",
+        (row_id,),
+    ).fetchone()
+    assert row["status"] == "pending"
+    assert row["attempts"] == 1
+    assert "extracted fact insert" in row["last_error"]
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +243,9 @@ def test_existing_summary_includes_topic_similar_facts_not_just_top_trust_recent
 def test_drain_extract_queue_caps_items_processed_per_tick(make_provider, aux_module):
     provider = make_provider(**_extraction_cfg())
     provider._extract_drain_batch = 2
+    provider._queue_stop.set()
+    if provider._queue_worker:
+        provider._queue_worker.join(timeout=2.0)
 
     aux_module.call_llm = lambda **kwargs: _llm_response("[]")
 

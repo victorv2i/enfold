@@ -62,7 +62,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List, Optional
 
 from plugins.memory.holographic import HolographicMemoryProvider
@@ -73,18 +73,23 @@ from .embeddings import FastEmbedder, OllamaEmbedder
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
 
+def _norm_token_sequence(text: str) -> tuple:
+    """Lowercased alphanumeric tokens in text order."""
+    return tuple(_WORD_RE.findall((text or "").lower()))
+
+
 def _norm_tokens(text: str) -> set:
     """Lowercased alphanumeric token set."""
-    return set(_WORD_RE.findall((text or "").lower()))
+    return set(_norm_token_sequence(text))
 
 
-def _value_tokens(text: str) -> set:
+def _value_tokens(text: str) -> tuple:
     """Tokens carrying a concrete value (numbers, ports, SHAs, ids, versions).
 
     A changed value means an UPDATE, not a duplicate, so these must match for a
     write to be treated as a near-duplicate and skipped.
     """
-    return {t for t in _norm_tokens(text) if any(c.isdigit() for c in t)}
+    return tuple(t for t in _norm_token_sequence(text) if any(c.isdigit() for c in t))
 
 
 def _jaccard(a: set, b: set) -> float:
@@ -103,6 +108,55 @@ _STOPWORDS = frozenset(
 def _content_tokens(text: str) -> set:
     """Significant (non-function) words."""
     return _norm_tokens(text) - _STOPWORDS
+
+
+_STATE_WORD_GROUPS = (
+    frozenset(("enabled", "disabled")),
+    frozenset(("active", "inactive", "archived")),
+    frozenset(("on", "off")),
+    frozenset(("open", "closed")),
+    frozenset(("paused", "resumed")),
+    frozenset(("up", "down")),
+    frozenset(("alive", "dead")),
+    frozenset(("started", "stopped")),
+)
+_STATE_WORDS = frozenset().union(*_STATE_WORD_GROUPS)
+
+
+def _state_words(text: str) -> set:
+    return _content_tokens(text) & _STATE_WORDS
+
+
+def _subjectish_tokens(text: str) -> set:
+    tokens = _content_tokens(text) - _STATE_WORDS
+    expanded = set(tokens)
+    for token in tokens:
+        for suffix in ("ation", "ing", "ed", "ic", "ion", "s"):
+            if token.endswith(suffix) and len(token) > len(suffix) + 2:
+                expanded.add(token[:-len(suffix)])
+    return expanded
+
+
+def _has_subjectish_overlap(content: str, other: str) -> bool:
+    return bool(_subjectish_tokens(content) & _subjectish_tokens(other))
+
+
+def _has_opposing_state_words(
+    content: str, other: str, *, require_context: bool = True
+) -> bool:
+    """True when opposite state words appear on opposite sides."""
+    if require_context and not _has_subjectish_overlap(content, other):
+        return False
+    a_states = _state_words(content)
+    b_states = _state_words(other)
+    if not a_states or not b_states:
+        return False
+    for group in _STATE_WORD_GROUPS:
+        a_group = a_states & group
+        b_group = b_states & group
+        if a_group and b_group and a_group != b_group:
+            return True
+    return False
 
 
 def _is_near_duplicate(content: str, other: str, threshold: float) -> bool:
@@ -137,17 +191,16 @@ def _is_semantic_duplicate(
     Postgres instead of MySQL". Returns False when *cosine* is None (embedder
     unavailable), so callers fall back to the Jaccard check alone.
 
-    Guards against a gap the Jaccard path already closes: when *content* and
-    *other* share almost all of their wording (raw Jaccard >= the near-restatement
-    bar) but differ in a content word, that is a state-word flip (active ->
-    archived, enabled -> disabled), i.e. an UPDATE, not a duplicate, even if the
-    embedder's cosine similarity is high. A pair with mostly different wording is
-    left to the cosine check alone, so genuine low-Jaccard paraphrases are still
-    caught.
+    Guards against polarity flips independently of Jaccard: opposing state words
+    such as enabled/disabled or active/archived mean UPDATE, not duplicate, even
+    if the embedder's cosine similarity is high. Other low-Jaccard paraphrases
+    can still be caught by the cosine check.
     """
     if cosine is None:
         return False
     if _value_tokens(content) != _value_tokens(other):
+        return False
+    if _has_opposing_state_words(content, other, require_context=False):
         return False
     if _content_tokens(content) != _content_tokens(other):
         if _jaccard(_norm_tokens(content), _norm_tokens(other)) >= _RESTATEMENT_JACCARD:
@@ -171,6 +224,7 @@ from .llm_extract import _format_conversation, extract_facts_from_transcript, in
 from .reflection import ensure_reflection_schema, invalidate_insights_citing, run_reflection
 from .retrieval_plus import PlusFactRetriever
 from .temporal import ensure_temporal_schema, fact_history, find_value_update_target, supersede
+from .write_lock import cross_process_write_lock
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +233,7 @@ _FTS_W     = 0.3
 _JACCARD_W = 0.2
 _HRR_W     = 0.2
 _EMBED_W   = 0.3
+_WARNED_CONFIG_CLAMPS: set[str] = set()
 
 
 # Per-model instruction prefixes, applied when embedding_prefix_policy="auto".
@@ -249,13 +304,66 @@ def _cfg_float(value: Any) -> Optional[float]:
         return None
 
 
+def _warn_config_clamp_once(key: str, message: str) -> None:
+    if key in _WARNED_CONFIG_CLAMPS:
+        return
+    _WARNED_CONFIG_CLAMPS.add(key)
+    logger.warning(message)
+
+
+def _clamp_embedding_weight(value: Any) -> float:
+    try:
+        raw = float(value)
+    except (TypeError, ValueError):
+        _warn_config_clamp_once(
+            "embedding_weight",
+            "enfold: clamped embedding_weight to the default because it was invalid",
+        )
+        return _EMBED_W
+    clamped = max(0.0, min(1.0, raw))
+    if clamped != raw:
+        _warn_config_clamp_once(
+            "embedding_weight",
+            "enfold: clamped embedding_weight to the [0, 1] range",
+        )
+    return clamped
+
+
+def _valid_holographic_weights(config: dict) -> tuple[float, float, float]:
+    try:
+        raw = (
+            float(config.get("fts_weight", _FTS_W)),
+            float(config.get("jaccard_weight", _JACCARD_W)),
+            float(config.get("hrr_weight", _HRR_W)),
+        )
+    except (TypeError, ValueError):
+        _warn_config_clamp_once(
+            "holographic_weights_fallback",
+            "enfold: using default holographic retrieval weights because one was invalid",
+        )
+        return _FTS_W, _JACCARD_W, _HRR_W
+    clamped = tuple(max(0.0, value) for value in raw)
+    if clamped != raw:
+        _warn_config_clamp_once(
+            "holographic_weights",
+            "enfold: clamped holographic retrieval weights to non-negative values",
+        )
+    if sum(clamped) <= 0:
+        _warn_config_clamp_once(
+            "holographic_weights_fallback",
+            "enfold: using default holographic retrieval weights because their sum was not positive",
+        )
+        return _FTS_W, _JACCARD_W, _HRR_W
+    return clamped
+
+
 class EnfoldProvider(HolographicMemoryProvider):
     """Holographic memory + dense embedding retrieval (FastEmbed or Ollama)."""
 
     def __init__(self, config: dict | None = None) -> None:
         super().__init__(config=config)
         cfg = self._config
-        self._embed_weight: float = float(cfg.get("embedding_weight", _EMBED_W))
+        self._embed_weight: float = _clamp_embedding_weight(cfg.get("embedding_weight", _EMBED_W))
         self._embedding_backend: str = str(cfg.get("embedding_backend", "fastembed")).lower()
         self._embedding_prefix_policy: str = str(cfg.get("embedding_prefix_policy", "none")).lower()
         # Explicit prefix overrides win over the per-model registry when the
@@ -312,6 +420,7 @@ class EnfoldProvider(HolographicMemoryProvider):
         self._backfill_thread: Optional[threading.Thread] = None
         self._backfill_stop: Optional[threading.Event] = None
         self._embed_pool: Optional[ThreadPoolExecutor] = None
+        self._generation: int = 0
 
         # Persistent extraction queue + its single worker thread
         self._extract_queue: Optional[ExtractQueue] = None
@@ -444,13 +553,8 @@ class EnfoldProvider(HolographicMemoryProvider):
         # Holographic signal weights are config-overridable so the HRR signal can
         # be down-weighted or disabled (hrr_weight: 0). Whatever the raw values,
         # they are rescaled to sum to 1.0 so the (1-ew)/ew blend budget holds.
-        fts_cfg = float(self._config.get("fts_weight", _FTS_W))
-        jac_cfg = float(self._config.get("jaccard_weight", _JACCARD_W))
-        hrr_cfg = float(self._config.get("hrr_weight", _HRR_W))
+        fts_cfg, jac_cfg, hrr_cfg = _valid_holographic_weights(self._config)
         holo_sum = fts_cfg + jac_cfg + hrr_cfg
-        if holo_sum <= 0:
-            fts_cfg, jac_cfg, hrr_cfg = _FTS_W, _JACCARD_W, _HRR_W
-            holo_sum = _FTS_W + _JACCARD_W + _HRR_W
         fts_w     = fts_cfg / holo_sum
         jaccard_w = jac_cfg / holo_sum
         hrr_w     = hrr_cfg / holo_sum
@@ -476,6 +580,7 @@ class EnfoldProvider(HolographicMemoryProvider):
         )
         self._embed_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="hp-embed")
         self._embedder_available = self._embedder.is_available()
+        generation = self._generation
 
         if self._embedder_available:
             logger.info(
@@ -486,7 +591,13 @@ class EnfoldProvider(HolographicMemoryProvider):
             self._backfill_stop = threading.Event()
             self._backfill_thread = threading.Thread(
                 target=self._backfill_embeddings,
-                args=(self._backfill_stop,),
+                args=(
+                    self._backfill_stop,
+                    generation,
+                    self._store,
+                    self._embed_store,
+                    self._embedder,
+                ),
                 daemon=True,
                 name="enfold_backfill",
             )
@@ -532,7 +643,15 @@ class EnfoldProvider(HolographicMemoryProvider):
         self._queue_wake = threading.Event()
         self._queue_worker = threading.Thread(
             target=self._queue_worker_loop,
-            args=(self._queue_stop, self._queue_wake, self._extract_queue),
+            args=(
+                self._queue_stop,
+                self._queue_wake,
+                self._extract_queue,
+                generation,
+                self._store,
+                self._embed_store,
+                self._embedder,
+            ),
             daemon=True,
             name="enfold_extract_queue",
         )
@@ -561,6 +680,7 @@ class EnfoldProvider(HolographicMemoryProvider):
         down. Only then is the previous store connection safe to close; the
         caller leaks it otherwise.
         """
+        self._generation += 1
         quiescent = True
         if self._queue_stop is not None:
             self._queue_stop.set()
@@ -675,6 +795,22 @@ class EnfoldProvider(HolographicMemoryProvider):
             )
             return False
 
+    def _write_lock_db_path(self, store=None) -> Optional[str]:
+        store = self._store if store is None else store
+        db_path = getattr(store, "db_path", None)
+        return str(db_path) if db_path is not None else None
+
+    def _generation_current(self, generation: Optional[int], label: str) -> bool:
+        if generation is None or generation == self._generation:
+            return True
+        logger.debug(
+            "enfold: dropping stale %s from generation %s; current generation is %s",
+            label,
+            generation,
+            self._generation,
+        )
+        return False
+
     # ------------------------------------------------------------------
     # Extraction queue worker
     # ------------------------------------------------------------------
@@ -684,6 +820,10 @@ class EnfoldProvider(HolographicMemoryProvider):
         stop: threading.Event,
         wake: threading.Event,
         queue: ExtractQueue,
+        generation: Optional[int] = None,
+        store=None,
+        embed_store=None,
+        embedder=None,
     ) -> None:
         """Single daemon worker: drain the extraction queue, tick embed backfill.
 
@@ -697,12 +837,13 @@ class EnfoldProvider(HolographicMemoryProvider):
                 break
             wake.clear()
             try:
-                self._drain_extract_queue(stop, queue)
+                self._drain_extract_queue(stop, queue, generation, store)
             except Exception as exc:
                 logger.warning("enfold: extraction queue drain failed: %s", exc)
             if self._reflection_enabled:
                 try:
-                    self.run_reflection(time.time())
+                    if self._generation_current(generation, "reflection pass"):
+                        self.run_reflection(time.time(), generation=generation, store=store)
                 except Exception as exc:
                     logger.warning("enfold: reflection pass failed: %s", exc)
             # Periodic backfill: re-embeds facts whose per-fact embed attempt
@@ -711,18 +852,31 @@ class EnfoldProvider(HolographicMemoryProvider):
                 last_backfill = time.monotonic()
                 if self._embedder_available:
                     try:
-                        self._backfill_embeddings(stop)
+                        self._backfill_embeddings(
+                            stop,
+                            generation,
+                            store,
+                            embed_store,
+                            embedder,
+                        )
                     except Exception as exc:
                         logger.debug("enfold: backfill tick failed: %s", exc)
 
-    def _drain_extract_queue(self, stop: threading.Event, queue: ExtractQueue) -> None:
+    def _drain_extract_queue(
+        self,
+        stop: threading.Event,
+        queue: ExtractQueue,
+        generation: Optional[int] = None,
+        store=None,
+    ) -> None:
         """Process up to _extract_drain_batch pending rows, or until stop is set.
 
         A large backlog (extraction was down, or a burst of sessions ended at
         once) drains a few items per poll tick instead of firing the
         extraction LLM back-to-back for the whole backlog in one go.
         """
-        if not self._store:
+        store = self._store if store is None else store
+        if not store:
             return
         if not self._extract_provider or not self._extract_model:
             return
@@ -744,7 +898,7 @@ class EnfoldProvider(HolographicMemoryProvider):
             try:
                 facts = extract_facts_from_transcript(
                     row["payload"],
-                    self._store,
+                    store,
                     provider=self._extract_provider,
                     model=self._extract_model,
                     effort=self._extract_effort,
@@ -752,16 +906,34 @@ class EnfoldProvider(HolographicMemoryProvider):
                         topic, min_trust=self._min_trust, limit=limit, bump=False
                     ),
                 )
+                if not self._generation_current(generation, "extraction insert"):
+                    break
                 inserted = 0
                 if facts:
-                    with self._deferred_bank_rebuild():
-                        inserted = insert_facts(
-                            self._store, facts, embed_callback=self._embed_cb,
-                            dedup_check=self._find_near_duplicate if self._dedup_on_add else None,
-                            update_check=self._find_update_target if self._dedup_on_add else None,
-                            supersede=self._supersede_fact if self._dedup_on_add else None,
+                    db_path = self._write_lock_db_path(store)
+                    lock_ctx = (
+                        cross_process_write_lock(db_path)
+                        if db_path is not None
+                        else nullcontext()
+                    )
+                    with lock_ctx:
+                        if not self._generation_current(generation, "extraction insert"):
+                            break
+                        with self._deferred_bank_rebuild(store):
+                            result = insert_facts(
+                                store, facts, embed_callback=self._embed_cb,
+                                dedup_check=self._find_near_duplicate if self._dedup_on_add else None,
+                                update_check=self._find_update_target if self._dedup_on_add else None,
+                                supersede=self._supersede_fact if self._dedup_on_add else None,
+                            )
+                    inserted = result.inserted
+                    if result.failed:
+                        raise RuntimeError(
+                            f"{result.failed} extracted fact insert(s) failed"
                         )
-                queue.mark_done(row["id"])
+                if not self._generation_current(generation, "extraction queue completion"):
+                    break
+                queue.mark_done(row["id"], row["lease_owner"])
                 self._queue_mem_attempts.pop(row["id"], None)
                 processed += 1
                 if inserted:
@@ -770,6 +942,8 @@ class EnfoldProvider(HolographicMemoryProvider):
                         row["id"], inserted,
                     )
             except Exception as exc:
+                if not self._generation_current(generation, "extraction queue failure"):
+                    break
                 if stop.is_set():
                     # Interrupted by shutdown/teardown: the DB connection is
                     # being closed under the worker (surfaces as a bad file
@@ -782,6 +956,7 @@ class EnfoldProvider(HolographicMemoryProvider):
                         "enfold: extraction interrupted by shutdown; "
                         "leaving queue item %s pending", row["id"],
                     )
+                    queue.release_claim(row["id"], row["lease_owner"])
                     break
                 err = str(exc)
                 if is_quota_error(err):
@@ -794,7 +969,7 @@ class EnfoldProvider(HolographicMemoryProvider):
                     delay = quota_retry_delay(err)
                     try:
                         rescheduled = queue.mark_quota_failed(
-                            row["id"], err, time.time() + delay
+                            row["id"], err, time.time() + delay, row["lease_owner"]
                         )
                     except Exception as mark_exc:
                         # Same safety bound as below: a row whose failure
@@ -802,6 +977,10 @@ class EnfoldProvider(HolographicMemoryProvider):
                         self._queue_mem_attempts[row["id"]] = (
                             self._queue_mem_attempts.get(row["id"], 0) + 1
                         )
+                        try:
+                            queue.release_claim(row["id"], row["lease_owner"])
+                        except Exception:
+                            pass
                         logger.debug(
                             "enfold: could not record queue quota "
                             "failure: %s",
@@ -831,9 +1010,14 @@ class EnfoldProvider(HolographicMemoryProvider):
                     )
                 try:
                     attempts = queue.mark_failed(
-                        row["id"], str(exc), max_attempts=self._queue_max_attempts
+                        row["id"], str(exc), max_attempts=self._queue_max_attempts,
+                        lease_owner=row["lease_owner"],
                     )
                 except Exception as mark_exc:
+                    try:
+                        queue.release_claim(row["id"], row["lease_owner"])
+                    except Exception:
+                        pass
                     logger.debug(
                         "enfold: could not record queue failure: %s", mark_exc
                     )
@@ -889,7 +1073,7 @@ class EnfoldProvider(HolographicMemoryProvider):
             self._submit_embed(self._embed_and_store, fact_id, content)
 
     @contextmanager
-    def _deferred_bank_rebuild(self):
+    def _deferred_bank_rebuild(self, store=None):
         """Batch seam: suppress the parent store's per-add category bank rebuild.
 
         MemoryStore.add_fact() ends with self._rebuild_bank(category), a FULL
@@ -911,7 +1095,7 @@ class EnfoldProvider(HolographicMemoryProvider):
         single facts added via tools keep the parent's immediate rebuild
         behavior.
         """
-        store = self._store
+        store = self._store if store is None else store
         if store is None:
             yield
             return
@@ -1120,45 +1304,44 @@ class EnfoldProvider(HolographicMemoryProvider):
 
         merged: List[Dict[str, Any]] = []
 
-        # Build a set of candidate fact_ids (holographic + top-K embedding)
+        # Build a set of candidate fact_ids (holographic + embedding-only).
         holo_ids = {r["fact_id"] for r in holo_results}
-        # Include top embedding candidates not caught by holographic FTS
-        top_emb_ids = {fid for fid, _ in emb_pairs[:limit * 2]}
-        extra_ids = top_emb_ids - holo_ids
-
-        # Fetch extra facts by ID if needed (same trust and category filters
-        # as the holographic candidates)
         extra_facts: List[Dict[str, Any]] = []
-        if extra_ids and self._store:
-            placeholders = ",".join("?" * len(extra_ids))
-            params: List[Any] = list(extra_ids) + [min_trust]
-            category_clause = ""
-            if category:
-                category_clause = " AND category = ?"
-                params.append(category)
+        if emb_pairs and self._store:
+            max_extra = limit * 2
+            category_clause = " AND category = ?" if category else ""
             with self._store._lock:
-                rows = self._store._conn.execute(
-                    f"""
-                    SELECT fact_id, content, category, tags, trust_score,
-                           retrieval_count, helpful_count, created_at, updated_at,
-                           invalid_at
-                    FROM facts
-                    WHERE fact_id IN ({placeholders})
-                      AND trust_score >= ?{category_clause}
-                    """,
-                    params,
-                ).fetchall()
-            for row in rows:
-                d = dict(row)
-                if _is_superseded(d.get("content", "")):
-                    excluded[d["fact_id"]] = {"reason": "superseded", "content": d.get("content")}
-                    continue
-                if self._temporal_filter and d.pop("invalid_at", None) is not None:
-                    excluded[d["fact_id"]] = {"reason": "temporally_invalid", "content": d.get("content")}
-                    continue
-                d.pop("invalid_at", None)
-                d["score"] = 0.0  # no holographic score
-                extra_facts.append(d)
+                for fid, _sim in emb_pairs:
+                    if len(extra_facts) >= max_extra:
+                        break
+                    if fid in holo_ids:
+                        continue
+                    params: List[Any] = [fid, min_trust]
+                    if category:
+                        params.append(category)
+                    row = self._store._conn.execute(
+                        f"""
+                        SELECT fact_id, content, category, tags, trust_score,
+                               retrieval_count, helpful_count, created_at, updated_at,
+                               invalid_at
+                        FROM facts
+                        WHERE fact_id = ?
+                          AND trust_score >= ?{category_clause}
+                        """,
+                        params,
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    d = dict(row)
+                    if _is_superseded(d.get("content", "")):
+                        excluded[d["fact_id"]] = {"reason": "superseded", "content": d.get("content")}
+                        continue
+                    if self._temporal_filter and d.pop("invalid_at", None) is not None:
+                        excluded[d["fact_id"]] = {"reason": "temporally_invalid", "content": d.get("content")}
+                        continue
+                    d.pop("invalid_at", None)
+                    d["score"] = 0.0  # no holographic score
+                    extra_facts.append(d)
 
         all_candidates = list(holo_results) + extra_facts
 
@@ -1386,6 +1569,22 @@ class EnfoldProvider(HolographicMemoryProvider):
             except Exception as exc:
                 return _json.dumps({"error": str(exc)})
 
+        if action == "add":
+            db_path = self._write_lock_db_path()
+            lock_ctx = (
+                cross_process_write_lock(db_path)
+                if db_path is not None
+                else nullcontext()
+            )
+            with lock_ctx:
+                return self._handle_fact_store_add_locked(args)
+
+        # For all other actions delegate to parent.
+        return super()._handle_fact_store(args)
+
+    def _handle_fact_store_add_locked(self, args: dict) -> str:
+        import json as _json
+        action = args.get("action")
         update_target: Optional[Dict[str, Any]] = None
         if action == "add" and self._dedup_on_add:
             content = (args.get("content") or "").strip()
@@ -1402,7 +1601,6 @@ class EnfoldProvider(HolographicMemoryProvider):
                 })
             update_target = self._find_update_target(content, category=category)
 
-        # For all other actions delegate to parent
         result_json = super()._handle_fact_store(args)
 
         if action == "add" and update_target is not None:
@@ -1477,23 +1675,32 @@ class EnfoldProvider(HolographicMemoryProvider):
             return None
         return find_value_update_target(content, results)
 
-    def _supersede_fact(self, old_fact_id: int, new_fact_id: int) -> None:
+    def _supersede_fact(self, old_fact_id: int, new_fact_id: int) -> bool:
         """Structurally supersede *old_fact_id* with *new_fact_id* (invalidate-not-delete).
 
         Never fails the caller's insert: any error here is logged and
         swallowed, leaving both rows live rather than losing the new fact.
         """
         if not self._store or old_fact_id == new_fact_id:
-            return
+            return False
         try:
             with self._store._lock:
-                supersede(self._store._conn, old_fact_id, new_fact_id)
-                invalidate_insights_citing(self._store._conn, old_fact_id)
+                updated = supersede(self._store._conn, old_fact_id, new_fact_id)
+                if updated:
+                    invalidate_insights_citing(self._store._conn, old_fact_id)
+                else:
+                    logger.debug(
+                        "enfold: supersede no-op old_fact_id=%s new_fact_id=%s",
+                        old_fact_id,
+                        new_fact_id,
+                    )
+                return updated
         except Exception as exc:
             logger.debug(
                 "enfold: supersede(%s -> %s) failed: %s",
                 old_fact_id, new_fact_id, exc,
             )
+            return False
 
     def fact_history(self, fact_id: int) -> List[Dict[str, Any]]:
         """Return the full supersession chain containing *fact_id*, oldest first.
@@ -1511,7 +1718,7 @@ class EnfoldProvider(HolographicMemoryProvider):
     # Sleep-time reflection: connection-drawing insight layer
     # ------------------------------------------------------------------
 
-    def run_reflection(self, now: float) -> int:
+    def run_reflection(self, now: float, generation: Optional[int] = None, store=None) -> int:
         """Run one opportunistic reflection pass; returns insights inserted.
 
         Called from the same background loop that drains the extraction
@@ -1520,12 +1727,14 @@ class EnfoldProvider(HolographicMemoryProvider):
         plumbing). The min-interval clock is persisted in the store, so a
         restart never resets it.
         """
-        if not self._store or not self._reflection_enabled:
+        store = self._store if store is None else store
+        if not store or not self._reflection_enabled:
             return 0
         if not self._extract_provider or not self._extract_model:
             return 0
+        embed_store = self._embed_store if store is self._store else None
         return run_reflection(
-            self._store._conn,
+            store._conn,
             now=now,
             enabled=self._reflection_enabled,
             interval_hours=self._reflection_interval_hours,
@@ -1533,17 +1742,30 @@ class EnfoldProvider(HolographicMemoryProvider):
             provider=self._extract_provider,
             model=self._extract_model,
             effort=self._extract_effort,
-            embed_store=self._embed_store if self._embedder_available else None,
+            embed_store=embed_store if self._embedder_available else None,
             embedding_identity=self._embedding_identity("document"),
             cosine_low=self._reflection_cosine_low,
             cosine_high=self._reflection_cosine_high,
             entity_hub_degree_limit=int(self._config.get("entity_hub_degree_limit", 25)),
             dedup_check=self._find_near_duplicate if self._dedup_on_add else None,
-            insert_fact=self._insert_reflection_fact,
-            lock=getattr(self._store, "_lock", None),
+            insert_fact=lambda content, category, tags: self._insert_reflection_fact(
+                content,
+                category,
+                tags,
+                generation=generation,
+                store=store,
+            ),
+            lock=getattr(store, "_lock", None),
         )
 
-    def _insert_reflection_fact(self, content: str, category: str, tags: str) -> int:
+    def _insert_reflection_fact(
+        self,
+        content: str,
+        category: str,
+        tags: str,
+        generation: Optional[int] = None,
+        store=None,
+    ) -> int:
         """Insert one accepted insight through the normal fact-add path.
 
         Reuses ``store.add_fact`` (so entity linking runs exactly as for any
@@ -1551,7 +1773,21 @@ class EnfoldProvider(HolographicMemoryProvider):
         queue uses, so an insight is retrievable by dense similarity like
         everything else.
         """
-        fact_id = self._store.add_fact(content, category=category, tags=tags)
+        store = self._store if store is None else store
+        if store is None:
+            return 0
+        if not self._generation_current(generation, "reflection insert"):
+            return 0
+        db_path = self._write_lock_db_path(store)
+        lock_ctx = (
+            cross_process_write_lock(db_path)
+            if db_path is not None
+            else nullcontext()
+        )
+        with lock_ctx:
+            if not self._generation_current(generation, "reflection insert"):
+                return 0
+            fact_id = store.add_fact(content, category=category, tags=tags)
         if fact_id:
             self._embed_cb(fact_id, content)
         return fact_id
@@ -1684,52 +1920,95 @@ class EnfoldProvider(HolographicMemoryProvider):
         down, so a fact is never silently lost.
         """
         pool = self._embed_pool
+        generation = self._generation
+        embedder = self._embedder
+        embed_store = self._embed_store
+        embedding_identity = self._embedding_identity("document")
+
+        def run_task():
+            fn(
+                *args,
+                generation=generation,
+                embedder=embedder,
+                embed_store=embed_store,
+                embedding_identity=embedding_identity,
+            )
+
         if pool is not None:
             try:
-                pool.submit(fn, *args)
+                pool.submit(run_task)
                 return
             except RuntimeError:
                 pass  # pool shut down mid-flight; fall through to inline
         try:
-            fn(*args)
+            run_task()
         except Exception as exc:
             logger.debug("enfold: inline embed fallback failed: %s", exc)
 
-    def _embed_and_store(self, fact_id: int, content: str) -> None:
+    def _embed_and_store(
+        self,
+        fact_id: int,
+        content: str,
+        *,
+        generation: Optional[int] = None,
+        embedder=None,
+        embed_store=None,
+        embedding_identity: Optional[str] = None,
+    ) -> None:
         """Compute embedding for one fact and persist it (runs in a thread)."""
         try:
-            if not self._embedder or not self._embed_store:
+            embedder = self._embedder if embedder is None else embedder
+            embed_store = self._embed_store if embed_store is None else embed_store
+            embedding_identity = embedding_identity or self._embedding_identity("document")
+            if not embedder or not embed_store:
                 return
-            vec = self._embedder.embed(self._embed_text(content, "document"))
+            if not self._generation_current(generation, "embed task"):
+                return
+            vec = embedder.embed(self._embed_text(content, "document"))
             if vec is not None:
-                self._embed_store.upsert(
+                if not self._generation_current(generation, "embed upsert"):
+                    return
+                embed_store.upsert(
                     fact_id,
                     vec,
-                    embedding_identity=self._embedding_identity("document"),
+                    embedding_identity=embedding_identity,
                 )
                 logger.debug("enfold: embedded fact %d", fact_id)
         except Exception as exc:
             logger.debug("enfold: _embed_and_store(%d) failed: %s", fact_id, exc)
 
-    def _backfill_embeddings(self, stop: Optional[threading.Event] = None) -> None:
+    def _backfill_embeddings(
+        self,
+        stop: Optional[threading.Event] = None,
+        generation: Optional[int] = None,
+        store=None,
+        embed_store=None,
+        embedder=None,
+    ) -> None:
         """Background thread: embed all facts that don't have embeddings yet.
 
         Checks *stop* between chunks so teardown can halt a long backfill
         instead of leaving it writing to a connection about to be replaced.
         """
         try:
-            if not self._store or not self._embed_store or not self._embedder:
+            store = self._store if store is None else store
+            embed_store = self._embed_store if embed_store is None else embed_store
+            embedder = self._embedder if embedder is None else embedder
+            embedding_identity = self._embedding_identity("document")
+            if not store or not embed_store or not embedder:
+                return
+            if not self._generation_current(generation, "backfill"):
                 return
 
-            with self._store._lock:
-                rows = self._store._conn.execute(
+            with store._lock:
+                rows = store._conn.execute(
                     "SELECT fact_id, content FROM facts ORDER BY fact_id"
                 ).fetchall()
 
             all_ids = [int(r["fact_id"]) for r in rows]
-            missing_ids = self._embed_store.ids_without_embeddings(
+            missing_ids = embed_store.ids_without_embeddings(
                 all_ids,
-                embedding_identity=self._embedding_identity("document"),
+                embedding_identity=embedding_identity,
             )
 
             if not missing_ids:
@@ -1760,23 +2039,29 @@ class EnfoldProvider(HolographicMemoryProvider):
                         count,
                     )
                     return
+                if not self._generation_current(generation, "backfill chunk"):
+                    return
                 chunk = pending[i:i + _BATCH]
                 contents = [c for _, c in chunk]
                 try:
-                    vecs = self._embedder.embed_batch(
+                    vecs = embedder.embed_batch(
                         [self._embed_text(c, "document") for c in contents]
                     )
                 except Exception as exc:
                     logger.debug("enfold backfill: batch embed failed: %s", exc)
                     continue
+                if not self._generation_current(generation, "backfill upsert"):
+                    return
                 for (fid, _content), vec in zip(chunk, vecs):
                     if vec is None:
                         continue
                     try:
-                        self._embed_store.upsert(
+                        if not self._generation_current(generation, "backfill upsert"):
+                            return
+                        embed_store.upsert(
                             fid,
                             vec,
-                            embedding_identity=self._embedding_identity("document"),
+                            embedding_identity=embedding_identity,
                         )
                         count += 1
                     except Exception as exc:

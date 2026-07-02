@@ -13,9 +13,9 @@ This module owns three things:
     on every ``initialize()``, including against a live-size store).
   - ``_is_value_update`` / ``find_value_update_target``: detects the case the
     write-time near-duplicate gate deliberately lets through, an incoming
-    fact whose CONTENT words match an existing fact but whose VALUE tokens
-    (numbers, ports, SHAs, ids, versions) differ, i.e. a value change rather
-    than a restatement or an unrelated new fact.
+    fact whose concrete value tokens differ, or whose state words flip across
+    the same subject context, i.e. a value change rather than a restatement
+    or an unrelated new fact.
   - ``supersede``: marks the old fact invalid and links it to the new one.
   - ``fact_history``: walks the ``superseded_by`` chain both directions from
     any fact in it.
@@ -29,11 +29,14 @@ supersession going forward.
 from __future__ import annotations
 
 import sqlite3
+import logging
 from typing import Any, Dict, List, Optional
 
 # Reuse the same content-token / value-token split as the near-duplicate gate
 # so a value-update decision is consistent with the dedup gate it complements.
-from . import _content_tokens, _value_tokens
+from . import _content_tokens, _has_opposing_state_words, _state_words, _value_tokens
+
+logger = logging.getLogger(__name__)
 
 
 def ensure_temporal_schema(conn: sqlite3.Connection) -> None:
@@ -74,26 +77,26 @@ _RESTATEMENT_JACCARD = 0.6
 
 
 def _is_value_update(content: str, other: str) -> bool:
-    """True if *content* is a VALUE UPDATE of *other*: same content words, a
-    changed concrete value.
+    """True if *content* is a VALUE UPDATE of *other*.
 
     This is deliberately the complement of the near-duplicate gate
     (``_is_near_duplicate`` / ``_is_semantic_duplicate`` in ``__init__.py``),
-    which requires *equal* value tokens. Here the value tokens must DIFFER
-    (otherwise it is a duplicate, not an update, and belongs to the dedup
-    gate) while the non-value content words stay the same, so "the port is
-    3100" -> "the port is 3200" qualifies but an unrelated fact about a
-    different topic does not.
+    which requires *equal* ordered value tokens and no opposing state words.
+    Here differing value tokens with the same non-value content, or opposing
+    state words with subject overlap, qualify as an update. Unrelated facts
+    still do not.
     """
     a_values, b_values = _value_tokens(content), _value_tokens(other)
     if a_values == b_values:
-        return False  # no value changed: not an update, the dedup gate owns this
-    if not a_values or not b_values:
-        return False  # need a concrete value on both sides to call it an update
-    # Compare content words with the (differing) value tokens themselves
-    # removed, so "port 3100" -> "port 3200" is judged on {"port"} == {"port"}.
-    a_words = _content_tokens(content) - a_values
-    b_words = _content_tokens(other) - b_values
+        return _has_opposing_state_words(content, other)
+    a_value_set = set(a_values)
+    b_value_set = set(b_values)
+    if not a_value_set or not b_value_set:
+        return _has_opposing_state_words(content, other)
+    # Compare content words with the differing value tokens and state words
+    # removed, so "port 3100" -> "port 3200" is judged on {"port"}.
+    a_words = _content_tokens(content) - a_value_set - _state_words(content)
+    b_words = _content_tokens(other) - b_value_set - _state_words(other)
     return a_words == b_words
 
 
@@ -116,12 +119,13 @@ def find_value_update_target(
     return None
 
 
-def supersede(conn: sqlite3.Connection, old_fact_id: int, new_fact_id: int) -> None:
+def supersede(conn: sqlite3.Connection, old_fact_id: int, new_fact_id: int) -> bool:
     """Mark *old_fact_id* invalid, superseded by *new_fact_id*.
 
-    Idempotent no-op if the old fact does not exist or is already superseded.
+    Returns True when the old row was invalidated. Returns False when the old
+    fact does not exist or is already superseded.
     """
-    conn.execute(
+    cur = conn.execute(
         """
         UPDATE facts
            SET invalid_at = CURRENT_TIMESTAMP,
@@ -131,6 +135,14 @@ def supersede(conn: sqlite3.Connection, old_fact_id: int, new_fact_id: int) -> N
         (new_fact_id, old_fact_id),
     )
     conn.commit()
+    updated = int(cur.rowcount) == 1
+    if not updated:
+        logger.debug(
+            "temporal: supersede no-op old_fact_id=%s new_fact_id=%s",
+            old_fact_id,
+            new_fact_id,
+        )
+    return updated
 
 
 def fact_history(conn: sqlite3.Connection, fact_id: int) -> List[Dict[str, Any]]:

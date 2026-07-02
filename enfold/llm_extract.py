@@ -16,12 +16,20 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
     from plugins.memory.holographic.store import MemoryStore
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class InsertFactsResult:
+    inserted: int = 0
+    skipped: int = 0
+    failed: int = 0
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
 
@@ -290,6 +298,26 @@ def extract_facts_from_transcript(
     return _parse_response(raw)
 
 
+def _content_exists(store: "MemoryStore", content: str) -> bool:
+    conn = getattr(store, "_conn", None)
+    if conn is None:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT fact_id FROM facts WHERE content = ? LIMIT 1",
+            (content,),
+        ).fetchone()
+    except Exception:
+        return False
+    return row is not None
+
+
+def _total_changes(store: "MemoryStore") -> Optional[int]:
+    conn = getattr(store, "_conn", None)
+    value = getattr(conn, "total_changes", None)
+    return int(value) if value is not None else None
+
+
 def insert_facts(
     store: "MemoryStore",
     facts: List[Dict[str, str]],
@@ -297,12 +325,11 @@ def insert_facts(
     dedup_check=None,  # optional: callable(content, category=...) -> existing fact dict or None
     update_check=None,  # optional: callable(content, category=...) -> existing fact dict or None
     supersede=None,  # optional: callable(old_fact_id, new_fact_id) -> None
-) -> int:
-    """Insert extracted facts into the store; returns the number stored.
+) -> InsertFactsResult:
+    """Insert extracted facts into the store and return outcome counts.
 
-    Per-fact failures are logged and skipped so one bad fact never drops the
-    rest of the batch. Duplicates resolve to their existing fact_id via the
-    store's content UNIQUE constraint.
+    Per-fact storage failures are logged and counted so the queue can retry
+    the transcript. Duplicates and empty facts count as skipped, not failed.
 
     When *dedup_check* is given (the provider's near-duplicate gate, the same
     one the interactive fact_store "add" action uses), each fact is checked
@@ -316,28 +343,45 @@ def insert_facts(
     behaviour as the interactive fact_store "add" action.
     """
     inserted = 0
+    skipped = 0
+    failed = 0
     for fact in facts:
         try:
+            content = str(fact.get("content", "")).strip()
+            category = str(fact.get("category", "general")).strip() or "general"
+            tags = str(fact.get("tags", "")).strip()
+            if not content:
+                skipped += 1
+                continue
             if dedup_check is not None:
-                dup = dedup_check(fact["content"], category=fact["category"])
+                dup = dedup_check(content, category=category)
                 if dup is not None:
                     logger.debug(
                         "llm_extract: skipped near-duplicate of fact %s: %r",
-                        dup.get("fact_id"), fact["content"][:80],
+                        dup.get("fact_id"), content[:80],
                     )
+                    skipped += 1
                     continue
+            if _content_exists(store, content):
+                skipped += 1
+                continue
             update_target = None
             if update_check is not None and supersede is not None:
-                update_target = update_check(fact["content"], category=fact["category"])
+                update_target = update_check(content, category=category)
+            before_changes = _total_changes(store)
             fact_id = store.add_fact(
-                fact["content"],
-                category=fact["category"],
-                tags=fact["tags"],
+                content,
+                category=category,
+                tags=tags,
             )
+            after_changes = _total_changes(store)
+            if before_changes is not None and after_changes == before_changes:
+                skipped += 1
+                continue
             inserted += 1
             if embed_callback and fact_id:
                 try:
-                    embed_callback(fact_id, fact["content"])
+                    embed_callback(fact_id, content)
                 except Exception as emb_exc:
                     logger.debug("llm_extract: embed callback failed for %d: %s", fact_id, emb_exc)
             if update_target is not None and fact_id and int(update_target["fact_id"]) != int(fact_id):
@@ -346,8 +390,9 @@ def insert_facts(
                 except Exception as sup_exc:
                     logger.debug("llm_extract: supersede callback failed for %d: %s", fact_id, sup_exc)
         except Exception as exc:
+            failed += 1
             logger.debug("llm_extract: add_fact failed: %s", exc)
 
     if inserted:
         logger.info("llm_extract: inserted %d/%d extracted facts", inserted, len(facts))
-    return inserted
+    return InsertFactsResult(inserted=inserted, skipped=skipped, failed=failed)

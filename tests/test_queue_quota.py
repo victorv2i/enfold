@@ -76,6 +76,12 @@ def _backdate(queue, row_id, hours):
     queue._conn.commit()
 
 
+def _claim(queue, row_id, max_attempts=5):
+    row = queue.next_pending(max_attempts=max_attempts)
+    assert row["id"] == row_id
+    return row
+
+
 # ---------------------------------------------------------------------------
 # Classification and delay parsing
 # ---------------------------------------------------------------------------
@@ -115,7 +121,10 @@ def test_unparseable_quota_error_falls_back_to_1800s(hp):
 def test_mark_quota_failed_does_not_consume_attempts(raw_queue):
     row_id = raw_queue.enqueue("quota limited payload")
     due = time.time() + 4716
-    assert raw_queue.mark_quota_failed(row_id, QUOTA_ERROR, due) is True
+    row = _claim(raw_queue, row_id)
+    assert raw_queue.mark_quota_failed(
+        row_id, QUOTA_ERROR, due, row["lease_owner"]
+    ) is True
     attempts, last_error, status, not_before = _row(raw_queue, row_id)
     assert attempts == 0
     assert status == "pending"
@@ -127,11 +136,14 @@ def test_mark_quota_failed_does_not_consume_attempts(raw_queue):
 def test_next_pending_skips_not_before_until_due(raw_queue):
     first = raw_queue.enqueue("rescheduled payload")
     second = raw_queue.enqueue("due payload")
-    raw_queue.mark_quota_failed(first, QUOTA_ERROR, time.time() + 3600)
+    first_row = _claim(raw_queue, first)
+    raw_queue.mark_quota_failed(
+        first, QUOTA_ERROR, time.time() + 3600, first_row["lease_owner"]
+    )
 
     row = raw_queue.next_pending(max_attempts=5)
     assert row["id"] == second
-    raw_queue.mark_done(second)
+    raw_queue.mark_done(second, row["lease_owner"])
     assert raw_queue.next_pending(max_attempts=5) is None
     # Both still count as pending even while one is waiting out its window
     assert raw_queue.pending_count() == 1
@@ -151,7 +163,10 @@ def test_next_pending_skips_not_before_until_due(raw_queue):
 def test_age_cap_kills_on_plain_failure(raw_queue):
     row_id = raw_queue.enqueue("ancient payload")
     _backdate(raw_queue, row_id, 49)
-    attempts = raw_queue.mark_failed(row_id, "backend down", max_attempts=5)
+    row = _claim(raw_queue, row_id)
+    attempts = raw_queue.mark_failed(
+        row_id, "backend down", max_attempts=5, lease_owner=row["lease_owner"]
+    )
     assert attempts == 1
     _, last_error, status, _ = _row(raw_queue, row_id)
     assert status == "dead"
@@ -161,7 +176,10 @@ def test_age_cap_kills_on_plain_failure(raw_queue):
 def test_age_cap_kills_quota_rows_too(raw_queue):
     row_id = raw_queue.enqueue("ancient quota payload")
     _backdate(raw_queue, row_id, 49)
-    assert raw_queue.mark_quota_failed(row_id, QUOTA_ERROR, time.time() + 60) is False
+    row = _claim(raw_queue, row_id)
+    assert raw_queue.mark_quota_failed(
+        row_id, QUOTA_ERROR, time.time() + 60, row["lease_owner"]
+    ) is False
     attempts, last_error, status, not_before = _row(raw_queue, row_id)
     assert status == "dead"
     assert attempts == 0
@@ -171,7 +189,10 @@ def test_age_cap_kills_quota_rows_too(raw_queue):
 
 def test_young_rows_unaffected_by_age_cap(raw_queue):
     row_id = raw_queue.enqueue("fresh payload")
-    raw_queue.mark_failed(row_id, "backend down", max_attempts=5)
+    row = _claim(raw_queue, row_id)
+    raw_queue.mark_failed(
+        row_id, "backend down", max_attempts=5, lease_owner=row["lease_owner"]
+    )
     _, last_error, status, _ = _row(raw_queue, row_id)
     assert status == "pending"
     assert "48h age cap" not in last_error
@@ -183,9 +204,10 @@ def test_young_rows_unaffected_by_age_cap(raw_queue):
 
 def test_revive_dead_resets_rows_to_pending(raw_queue):
     row_id = raw_queue.enqueue("doomed payload")
-    raw_queue.mark_quota_failed(row_id, QUOTA_ERROR, time.time() + 3600)
-    raw_queue.mark_failed(row_id, "boom", max_attempts=1)
-    # mark_failed leaves the stale not_before; revive must clear it
+    row = _claim(raw_queue, row_id)
+    raw_queue.mark_failed(
+        row_id, "boom", max_attempts=1, lease_owner=row["lease_owner"]
+    )
     raw_queue._conn.execute(
         "UPDATE extract_queue SET not_before = ? WHERE id = ?",
         (time.time() + 3600, row_id),
@@ -206,8 +228,10 @@ def test_revive_dead_resets_rows_to_pending(raw_queue):
 def test_revive_dead_with_ids_only_touches_those(raw_queue):
     first = raw_queue.enqueue("dead one")
     second = raw_queue.enqueue("dead two")
-    raw_queue.mark_failed(first, "boom", max_attempts=1)
-    raw_queue.mark_failed(second, "boom", max_attempts=1)
+    row = _claim(raw_queue, first, max_attempts=1)
+    raw_queue.mark_failed(first, "boom", max_attempts=1, lease_owner=row["lease_owner"])
+    row = _claim(raw_queue, second, max_attempts=1)
+    raw_queue.mark_failed(second, "boom", max_attempts=1, lease_owner=row["lease_owner"])
 
     assert raw_queue.revive_dead(ids=[second]) == 1
     assert _row(raw_queue, first)[2] == "dead"
@@ -219,9 +243,12 @@ def test_revive_recent_quota_dead_filters(raw_queue):
     quota_id = raw_queue.enqueue("young quota dead")
     other_id = raw_queue.enqueue("young plain dead")
     old_id = raw_queue.enqueue("old quota dead")
-    raw_queue.mark_failed(quota_id, QUOTA_ERROR, max_attempts=1)
-    raw_queue.mark_failed(other_id, "backend down", max_attempts=1)
-    raw_queue.mark_failed(old_id, QUOTA_ERROR, max_attempts=1)
+    row = _claim(raw_queue, quota_id, max_attempts=1)
+    raw_queue.mark_failed(quota_id, QUOTA_ERROR, max_attempts=1, lease_owner=row["lease_owner"])
+    row = _claim(raw_queue, other_id, max_attempts=1)
+    raw_queue.mark_failed(other_id, "backend down", max_attempts=1, lease_owner=row["lease_owner"])
+    row = _claim(raw_queue, old_id, max_attempts=1)
+    raw_queue.mark_failed(old_id, QUOTA_ERROR, max_attempts=1, lease_owner=row["lease_owner"])
     _backdate(raw_queue, old_id, 49)
 
     assert raw_queue.revive_recent_quota_dead() == 1
@@ -250,6 +277,8 @@ def test_migration_adds_column_once_and_is_idempotent(hp, tmp_path):
         queue = hp.extract_queue.ExtractQueue(conn)
         cols = [r[1] for r in conn.execute("PRAGMA table_info(extract_queue)")]
         assert cols.count("not_before") == 1
+        assert cols.count("lease_owner") == 1
+        assert cols.count("lease_until") == 1
         # Pre-migration row stays retrievable with a NULL not_before
         row = queue.next_pending(max_attempts=5)
         assert row["payload"] == "pre-migration row"
@@ -258,6 +287,8 @@ def test_migration_adds_column_once_and_is_idempotent(hp, tmp_path):
         hp.extract_queue.ExtractQueue(conn)
         cols = [r[1] for r in conn.execute("PRAGMA table_info(extract_queue)")]
         assert cols.count("not_before") == 1
+        assert cols.count("lease_owner") == 1
+        assert cols.count("lease_until") == 1
     finally:
         conn.close()
 
@@ -305,9 +336,12 @@ def test_initialize_auto_revives_young_quota_dead_only(hp, make_provider, aux_mo
     quota_id = queue.enqueue("USER: I always use pnpm for node projects.")
     other_id = queue.enqueue("USER: transcript killed by a real failure")
     old_id = queue.enqueue("USER: quota transcript past the age cap")
-    queue.mark_failed(quota_id, QUOTA_ERROR, max_attempts=1)
-    queue.mark_failed(other_id, "backend down", max_attempts=1)
-    queue.mark_failed(old_id, QUOTA_ERROR, max_attempts=1)
+    row = _claim(queue, quota_id, max_attempts=1)
+    queue.mark_failed(quota_id, QUOTA_ERROR, max_attempts=1, lease_owner=row["lease_owner"])
+    row = _claim(queue, other_id, max_attempts=1)
+    queue.mark_failed(other_id, "backend down", max_attempts=1, lease_owner=row["lease_owner"])
+    row = _claim(queue, old_id, max_attempts=1)
+    queue.mark_failed(old_id, QUOTA_ERROR, max_attempts=1, lease_owner=row["lease_owner"])
     conn.execute(
         "UPDATE extract_queue SET created_at = datetime('now', '-49 hours') WHERE id = ?",
         (old_id,),
