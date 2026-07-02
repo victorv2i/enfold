@@ -8,7 +8,11 @@ venv/
 .pytest_cache/
 .ruff_cache/
 *.db
+*.sqlite
 *.db-shm
 *.db-wal
+*.sqlite-shm
+*.sqlite-wal
+*.mcp-write.lock
 .DS_Store
 .serena/

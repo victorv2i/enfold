@@ -42,6 +42,7 @@ That's the whole setup. Your agent now has `memory_search`, `memory_add`, `memor
 Two things to know:
 
 - Run the server **by file path**, never `python -m` (details in [MCP server](#mcp-server)).
+- FastEmbed downloads its model on first run; without an embedding backend, the server still works with keyword and symbolic recall only.
 - Without a Hermes checkout, the server runs on a bundled lightweight engine (real SQLite, FTS5, trust scores, and entity links; the same harness the 300-test suite runs against). For the full holographic engine, add `--hermes-src /path/to/hermes-agent/src`. A plain `git clone` of hermes-agent is enough: no install, no running gateway.
 
 ## Quickstart: Codex CLI
@@ -233,6 +234,22 @@ There is also a larger harness under `memory_eval/` for end-to-end sweeps agains
 - Python 3 (developed and tested on 3.13) and `numpy`.
 - For the MCP server: `pip install mcp`, plus one embedding backend (`fastembed` for CPU-only, or a running Ollama for GPU).
 - For the Hermes provider: a working Hermes Agent install.
+
+## Operations
+
+By default, Hermes stores Enfold data in `~/.hermes/memory_store.db`. MCP users can choose any file with `--db-path`.
+
+SQLite may create `-wal` and `-shm` sidecars next to the database, and MCP writes use a `.mcp-write.lock` sidecar. For backups, copy the database after a checkpoint or while the server is idle so WAL contents are not missed.
+
+To uninstall MCP use, remove the MCP registration and delete the database file if you no longer need the facts. To uninstall Hermes use, remove the copied plugin directory from `~/.hermes/plugins/` and reset `memory.provider`.
+
+Troubleshooting:
+
+- Missing `mcp` package: install with `pip install -e .[mcp]` or `pip install mcp`.
+- FastEmbed download failure: retry with network access or switch to an Ollama backend.
+- Ollama down: recall still runs, but dense embedding recall is degraded.
+- `hrr-dim` mismatch crash: restart with the same `--hrr-dim` as the Hermes gateway.
+- Explicit `--hermes-src` that fails now exits instead of silently falling back.
 
 ## Credits
 

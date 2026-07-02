@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "enfold"
+version = "0.7.0"
+description = "Enfold memory: local holographic SQLite fact store with FastEmbed dense retrieval, a persistent LLM fact-extraction queue, and debounced bank rebuilds."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+mcp = ["mcp"]
+fastembed = ["fastembed"]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["enfold"]
