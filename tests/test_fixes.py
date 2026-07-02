@@ -9,14 +9,14 @@ import types
 
 import pytest
 
-from holographic_plus import _blend_score
-from holographic_plus.llm_extract import (
+from enfold import _blend_score
+from enfold.llm_extract import (
     _extract_json_array,
     _parse_response,
     extract_facts_from_transcript,
     insert_facts,
 )
-from holographic_plus.embeddings import OllamaEmbedder
+from enfold.embeddings import OllamaEmbedder
 
 
 # --- robust JSON parsing ---------------------------------------------------

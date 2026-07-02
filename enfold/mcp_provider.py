@@ -1,10 +1,10 @@
-"""Provider factory for the holographic_plus MCP server.
+"""Provider factory for the enfold MCP server.
 
-Builds a real ``HolographicPlusProvider`` against a configurable db_path, the
+Builds a real ``EnfoldProvider`` against a configurable db_path, the
 same way the offline ``explain.py`` CLI does, but resolves the parent
 ``plugins.memory.holographic`` modules from one of two sources:
 
-  1. A real Hermes checkout, pointed at by the ``HOLOPLUS_HERMES_SRC`` env var
+  1. A real Hermes checkout, pointed at by the ``ENFOLD_HERMES_SRC`` env var
      (default ``~/hermes-migration-stage/src`` on this box). This is how the
      server shares the *exact* live store the Hermes gateway writes to.
   2. The repo's bundled ``tests/fake_hermes`` stubs, as a documented fallback
@@ -122,7 +122,7 @@ def resolve_parent_modules(hermes_src: Optional[str] = None) -> str:
     """Ensure ``plugins.memory.holographic`` is importable; return which source was used.
 
     Returns ``"real"`` or ``"fake_hermes"``. Tries the real checkout first
-    (env var ``HOLOPLUS_HERMES_SRC``, else ``DEFAULT_HERMES_SRC``); falls back
+    (env var ``ENFOLD_HERMES_SRC``, else ``DEFAULT_HERMES_SRC``); falls back
     to the bundled stubs on any failure, and never raises.
     """
     if _PARENT_PKG in sys.modules and hasattr(sys.modules[_PARENT_PKG], "HolographicMemoryProvider"):
@@ -131,18 +131,18 @@ def resolve_parent_modules(hermes_src: Optional[str] = None) -> str:
         # rather than re-importing. Anything installed without going through
         # this module (no source marker) is assumed to be the fake stubs,
         # since that is the only other installer in this codebase.
-        return getattr(sys.modules[_PARENT_PKG], "_hp_mcp_source", "fake_hermes")
+        return getattr(sys.modules[_PARENT_PKG], "_enfold_mcp_source", "fake_hermes")
 
-    src = hermes_src or os.environ.get("HOLOPLUS_HERMES_SRC", DEFAULT_HERMES_SRC)
+    src = hermes_src or os.environ.get("ENFOLD_HERMES_SRC", DEFAULT_HERMES_SRC)
     if _real_parent_available(src):
         try:
             _install_real_parent(src)
-            sys.modules[_PARENT_PKG]._hp_mcp_source = "real"
-            logger.info("holographic_plus MCP: using real hermes parent at %s", src)
+            sys.modules[_PARENT_PKG]._enfold_mcp_source = "real"
+            logger.info("enfold MCP: using real hermes parent at %s", src)
             return "real"
         except Exception as exc:
             logger.warning(
-                "holographic_plus MCP: real hermes parent at %s failed to import (%s), "
+                "enfold MCP: real hermes parent at %s failed to import (%s), "
                 "falling back to fake_hermes stubs",
                 src, exc,
             )
@@ -151,20 +151,20 @@ def resolve_parent_modules(hermes_src: Optional[str] = None) -> str:
                     sys.modules.pop(name, None)
 
     _install_fake_parent()
-    sys.modules[_PARENT_PKG]._hp_mcp_source = "fake_hermes"
+    sys.modules[_PARENT_PKG]._enfold_mcp_source = "fake_hermes"
     logger.info(
-        "holographic_plus MCP: real hermes parent not found at %s, "
+        "enfold MCP: real hermes parent not found at %s, "
         "using tests/fake_hermes stubs",
         src,
     )
     return "fake_hermes"
 
 
-def _load_holographic_plus_module():
-    """Import the holographic_plus package fresh, bound to whichever parent
+def _load_enfold_module():
+    """Import the enfold package fresh, bound to whichever parent
     modules resolve_parent_modules() just installed in sys.modules."""
-    name = "holographic_plus"
-    if name in sys.modules and hasattr(sys.modules[name], "HolographicPlusProvider"):
+    name = "enfold"
+    if name in sys.modules and hasattr(sys.modules[name], "EnfoldProvider"):
         return sys.modules[name]
     pkg_dir = Path(__file__).resolve().parent
     spec = importlib.util.spec_from_file_location(
@@ -205,10 +205,10 @@ def build_provider(
     busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
     session_id: str = "mcp-server",
 ):
-    """Construct and initialize a HolographicPlusProvider against *db_path*.
+    """Construct and initialize a EnfoldProvider against *db_path*.
 
     Resolves the parent hermes modules (real checkout or fake_hermes stubs),
-    loads the holographic_plus package against them, and initializes a
+    loads the enfold package against them, and initializes a
     provider with the given config. ``embedding_backend="fake"`` builds an
     in-process deterministic embedder instead of a network backend, for
     tests only.
@@ -217,7 +217,7 @@ def build_provider(
     when done); this mirrors the ``explain.py`` CLI's own usage.
     """
     resolve_parent_modules(hermes_src)
-    hp = _load_holographic_plus_module()
+    hp = _load_enfold_module()
 
     config = {
         "db_path": db_path,
@@ -238,13 +238,13 @@ def build_provider(
 
         fake_embedder = fake_hermes.FakeEmbedder()
 
-        class _FakeEmbedProvider(hp.HolographicPlusProvider):
+        class _FakeEmbedProvider(hp.EnfoldProvider):
             def _create_embedder(self):
                 return fake_embedder
 
         provider = _FakeEmbedProvider(config=config)
     else:
-        provider = hp.HolographicPlusProvider(config=config)
+        provider = hp.EnfoldProvider(config=config)
 
     _initialize_with_retry(provider, session_id)
     _apply_busy_timeout(provider, busy_timeout_ms)

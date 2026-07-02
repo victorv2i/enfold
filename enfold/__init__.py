@@ -1,4 +1,4 @@
-"""holographic_plus: Holographic memory with dense embedding retrieval.
+"""enfold: Holographic memory with dense embedding retrieval.
 
 Extends HolographicMemoryProvider with a 4th retrieval signal: dense cosine
 similarity. The embedder is pluggable, FastEmbed (local CPU, the default) or
@@ -51,7 +51,7 @@ First-run behaviour:
 Usage: change config.yaml::
 
     memory:
-      provider: holographic_plus
+      provider: enfold
 """
 
 from __future__ import annotations
@@ -249,7 +249,7 @@ def _cfg_float(value: Any) -> Optional[float]:
         return None
 
 
-class HolographicPlusProvider(HolographicMemoryProvider):
+class EnfoldProvider(HolographicMemoryProvider):
     """Holographic memory + dense embedding retrieval (FastEmbed or Ollama)."""
 
     def __init__(self, config: dict | None = None) -> None:
@@ -395,7 +395,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
 
     @property
     def name(self) -> str:
-        return "holographic_plus"
+        return "enfold"
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -423,13 +423,13 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 try:
                     prev_store.close()
                 except Exception as exc:
-                    logger.debug("holographic_plus: closing previous store failed: %s", exc)
+                    logger.debug("enfold: closing previous store failed: %s", exc)
             else:
                 # A previous worker, backfill thread, or pool task may still be
                 # mid-write on that connection. Leaking it beats closing it
                 # under a writer (and the parent always leaked it anyway).
                 logger.warning(
-                    "holographic_plus: previous store connection left open, "
+                    "enfold: previous store connection left open, "
                     "background work from the prior session may still be using it"
                 )
 
@@ -479,7 +479,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
 
         if self._embedder_available:
             logger.info(
-                "holographic_plus: embedding backend available (%s, model=%s)",
+                "enfold: embedding backend available (%s, model=%s)",
                 self._embedding_backend, self._embedding_model_name(),
             )
             # Kick off background backfill for facts without embeddings
@@ -488,12 +488,12 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 target=self._backfill_embeddings,
                 args=(self._backfill_stop,),
                 daemon=True,
-                name="holographic_plus_backfill",
+                name="enfold_backfill",
             )
             self._backfill_thread.start()
         else:
             logger.warning(
-                "holographic_plus: embedding backend %s not available, "
+                "enfold: embedding backend %s not available, "
                 "falling back to holographic-only retrieval",
                 self._embedding_backend,
             )
@@ -512,17 +512,17 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             revived = self._extract_queue.revive_recent_quota_dead()
             if revived:
                 logger.info(
-                    "holographic_plus: auto-revived %d quota-dead extraction(s) "
+                    "enfold: auto-revived %d quota-dead extraction(s) "
                     "younger than the 48h age cap",
                     revived,
                 )
         except Exception as exc:
-            logger.debug("holographic_plus: quota-dead revival failed: %s", exc)
+            logger.debug("enfold: quota-dead revival failed: %s", exc)
         try:
             pending = self._extract_queue.pending_count()
             if pending:
                 logger.info(
-                    "holographic_plus: draining %d queued extraction(s) from a previous run",
+                    "enfold: draining %d queued extraction(s) from a previous run",
                     pending,
                 )
         except Exception:
@@ -534,7 +534,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             target=self._queue_worker_loop,
             args=(self._queue_stop, self._queue_wake, self._extract_queue),
             daemon=True,
-            name="holographic_plus_extract_queue",
+            name="enfold_extract_queue",
         )
         self._queue_worker.start()
         self._queue_wake.set()
@@ -574,7 +574,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             if worker.is_alive():
                 quiescent = False
                 logger.warning(
-                    "holographic_plus: extraction worker still busy after 0.5s, "
+                    "enfold: extraction worker still busy after 0.5s, "
                     "it will exit at its next stop check"
                 )
         backfill = self._backfill_thread
@@ -583,7 +583,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             if backfill.is_alive():
                 quiescent = False
                 logger.warning(
-                    "holographic_plus: backfill thread still busy after 0.5s, "
+                    "enfold: backfill thread still busy after 0.5s, "
                     "it will exit at its next chunk"
                 )
         self._queue_worker = None
@@ -667,11 +667,11 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             self._extract_queue.enqueue(transcript)
             if self._queue_wake is not None:
                 self._queue_wake.set()
-            logger.debug("holographic_plus: queued extraction from %s", source)
+            logger.debug("enfold: queued extraction from %s", source)
             return True
         except Exception as exc:
             logger.warning(
-                "holographic_plus: failed to enqueue extraction (%s): %s", source, exc
+                "enfold: failed to enqueue extraction (%s): %s", source, exc
             )
             return False
 
@@ -699,12 +699,12 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             try:
                 self._drain_extract_queue(stop, queue)
             except Exception as exc:
-                logger.warning("holographic_plus: extraction queue drain failed: %s", exc)
+                logger.warning("enfold: extraction queue drain failed: %s", exc)
             if self._reflection_enabled:
                 try:
                     self.run_reflection(time.time())
                 except Exception as exc:
-                    logger.warning("holographic_plus: reflection pass failed: %s", exc)
+                    logger.warning("enfold: reflection pass failed: %s", exc)
             # Periodic backfill: re-embeds facts whose per-fact embed attempt
             # failed (transient backend errors are otherwise silently dropped).
             if time.monotonic() - last_backfill >= self._backfill_interval:
@@ -713,7 +713,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                     try:
                         self._backfill_embeddings(stop)
                     except Exception as exc:
-                        logger.debug("holographic_plus: backfill tick failed: %s", exc)
+                        logger.debug("enfold: backfill tick failed: %s", exc)
 
     def _drain_extract_queue(self, stop: threading.Event, queue: ExtractQueue) -> None:
         """Process up to _extract_drain_batch pending rows, or until stop is set.
@@ -766,7 +766,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 processed += 1
                 if inserted:
                     logger.info(
-                        "holographic_plus: extraction queue item %d stored %d facts",
+                        "enfold: extraction queue item %d stored %d facts",
                         row["id"], inserted,
                     )
             except Exception as exc:
@@ -779,7 +779,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                     # of burning a retry attempt and logging an error on every
                     # gateway restart.
                     logger.debug(
-                        "holographic_plus: extraction interrupted by shutdown; "
+                        "enfold: extraction interrupted by shutdown; "
                         "leaving queue item %s pending", row["id"],
                     )
                     break
@@ -803,20 +803,20 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                             self._queue_mem_attempts.get(row["id"], 0) + 1
                         )
                         logger.debug(
-                            "holographic_plus: could not record queue quota "
+                            "enfold: could not record queue quota "
                             "failure: %s",
                             mark_exc,
                         )
                         break
                     if rescheduled:
                         logger.warning(
-                            "holographic_plus: queue item %d hit a provider "
+                            "enfold: queue item %d hit a provider "
                             "quota limit, next attempt in ~%ds: %s",
                             row["id"], int(delay), exc,
                         )
                     else:
                         logger.warning(
-                            "holographic_plus: queue item %d marked dead by "
+                            "enfold: queue item %d marked dead by "
                             "the 48h age cap",
                             row["id"],
                         )
@@ -825,7 +825,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 self._queue_mem_attempts[row["id"]] = mem_attempts
                 if mem_attempts >= self._queue_max_attempts:
                     logger.warning(
-                        "holographic_plus: queue item %d dropped in-process after "
+                        "enfold: queue item %d dropped in-process after "
                         "%d attempts",
                         row["id"], mem_attempts,
                     )
@@ -835,16 +835,16 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                     )
                 except Exception as mark_exc:
                     logger.debug(
-                        "holographic_plus: could not record queue failure: %s", mark_exc
+                        "enfold: could not record queue failure: %s", mark_exc
                     )
                     break
                 logger.warning(
-                    "holographic_plus: extraction attempt %d for queue item %d failed: %s",
+                    "enfold: extraction attempt %d for queue item %d failed: %s",
                     attempts, row["id"], exc,
                 )
                 if attempts >= self._queue_max_attempts:
                     logger.warning(
-                        "holographic_plus: queue item %d marked dead after %d attempts",
+                        "enfold: queue item %d marked dead after %d attempts",
                         row["id"], attempts,
                     )
                     continue  # dead rows are never retried, skip the backoff wait
@@ -874,13 +874,13 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 ).fetchone()
             if row is not None:
                 logger.info(
-                    "holographic_plus: wal_checkpoint(TRUNCATE) busy=%s wal_pages=%s checkpointed=%s",
+                    "enfold: wal_checkpoint(TRUNCATE) busy=%s wal_pages=%s checkpointed=%s",
                     row[0], row[1], row[2],
                 )
                 return tuple(row)
             return None
         except Exception as exc:
-            logger.debug("holographic_plus: wal_checkpoint failed: %s", exc)
+            logger.debug("enfold: wal_checkpoint failed: %s", exc)
             return None
 
     def _embed_cb(self, fact_id: int, content: str) -> None:
@@ -930,7 +930,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                     store._rebuild_bank(category)
                 except Exception as exc:
                     logger.warning(
-                        "holographic_plus: deferred bank rebuild for %r failed: %s",
+                        "enfold: deferred bank rebuild for %r failed: %s",
                         category, exc,
                     )
 
@@ -955,7 +955,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         try:
             result = _json.loads(result_json)
         except Exception as exc:
-            logger.debug("holographic_plus: failed to parse fact_store result: %s", exc)
+            logger.debug("enfold: failed to parse fact_store result: %s", exc)
             return
 
         try:
@@ -978,7 +978,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 self._embed_store.delete(int(args["fact_id"]))
 
         except Exception as exc:
-            logger.debug("holographic_plus: embedding sidecar sync failed: %s", exc)
+            logger.debug("enfold: embedding sidecar sync failed: %s", exc)
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes + embed them."""
@@ -995,7 +995,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 if row:
                     self._submit_embed(self._embed_and_store, int(row["fact_id"]), content)
             except Exception as exc:
-                logger.debug("holographic_plus: on_memory_write embed failed: %s", exc)
+                logger.debug("enfold: on_memory_write embed failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Prefetch: merge holographic + embedding scores
@@ -1015,9 +1015,9 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 embed_score = r.get("embedding_score")
                 embed_note = f", emb={embed_score:.3f}" if embed_score is not None else ""
                 lines.append(f"- [{trust:.1f}{embed_note}] {r.get('content', '')}")
-            return "## Holographic+ Memory\n" + "\n".join(lines)
+            return "## Enfold Memory\n" + "\n".join(lines)
         except Exception as exc:
-            logger.debug("holographic_plus prefetch failed: %s", exc)
+            logger.debug("enfold prefetch failed: %s", exc)
             return ""
 
     # ------------------------------------------------------------------
@@ -1086,7 +1086,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         try:
             query_vec = self._embedder.embed(self._embed_text(query, "query"))
         except Exception as exc:
-            logger.debug("holographic_plus: query embed failed: %s", exc)
+            logger.debug("enfold: query embed failed: %s", exc)
             query_vec = None
 
         if query_vec is None:
@@ -1107,7 +1107,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 embedding_identity=self._embedding_identity("query"),
             )
         except Exception as exc:
-            logger.debug("holographic_plus: score_all failed: %s", exc)
+            logger.debug("enfold: score_all failed: %s", exc)
             emb_pairs = []
 
         emb_scores: Dict[int, float] = {fid: sim for fid, sim in emb_pairs}
@@ -1295,7 +1295,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                     ids,
                 ).fetchall()
         except Exception as exc:
-            logger.debug("holographic_plus: temporal filter lookup failed: %s", exc)
+            logger.debug("enfold: temporal filter lookup failed: %s", exc)
             return (results, []) if return_excluded else results
         invalid_ids = {int(r["fact_id"]) for r in rows}
         if not invalid_ids:
@@ -1363,7 +1363,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 )
                 self._store._conn.commit()
         except Exception as exc:
-            logger.debug("holographic_plus: retrieval_count bump failed: %s", exc)
+            logger.debug("enfold: retrieval_count bump failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Tool handler override: expose search with embeddings
@@ -1441,7 +1441,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 bump=False,
             )
         except Exception as exc:
-            logger.debug("holographic_plus: dedup search failed: %s", exc)
+            logger.debug("enfold: dedup search failed: %s", exc)
             return None
         for r in results:
             other = r.get("content", "")
@@ -1473,7 +1473,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 limit=3, bump=False,
             )
         except Exception as exc:
-            logger.debug("holographic_plus: update-target search failed: %s", exc)
+            logger.debug("enfold: update-target search failed: %s", exc)
             return None
         return find_value_update_target(content, results)
 
@@ -1491,7 +1491,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 invalidate_insights_citing(self._store._conn, old_fact_id)
         except Exception as exc:
             logger.debug(
-                "holographic_plus: supersede(%s -> %s) failed: %s",
+                "enfold: supersede(%s -> %s) failed: %s",
                 old_fact_id, new_fact_id, exc,
             )
 
@@ -1628,7 +1628,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                 logger.debug("rebuild_embeddings: prune_stale failed: %s", exc)
 
         logger.info(
-            "holographic_plus: rebuild_embeddings complete, %d/%d embedded in "
+            "enfold: rebuild_embeddings complete, %d/%d embedded in "
             "%.1fs (%d superseded pruned)",
             embedded, total, elapsed, pruned_stale,
         )
@@ -1663,7 +1663,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         after = self._embed_store.identity_counts()
         if pruned:
             logger.info(
-                "holographic_plus: vacuum_embeddings pruned %d superseded vector(s)",
+                "enfold: vacuum_embeddings pruned %d superseded vector(s)",
                 pruned,
             )
         return {
@@ -1693,7 +1693,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
         try:
             fn(*args)
         except Exception as exc:
-            logger.debug("holographic_plus: inline embed fallback failed: %s", exc)
+            logger.debug("enfold: inline embed fallback failed: %s", exc)
 
     def _embed_and_store(self, fact_id: int, content: str) -> None:
         """Compute embedding for one fact and persist it (runs in a thread)."""
@@ -1707,9 +1707,9 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                     vec,
                     embedding_identity=self._embedding_identity("document"),
                 )
-                logger.debug("holographic_plus: embedded fact %d", fact_id)
+                logger.debug("enfold: embedded fact %d", fact_id)
         except Exception as exc:
-            logger.debug("holographic_plus: _embed_and_store(%d) failed: %s", fact_id, exc)
+            logger.debug("enfold: _embed_and_store(%d) failed: %s", fact_id, exc)
 
     def _backfill_embeddings(self, stop: Optional[threading.Event] = None) -> None:
         """Background thread: embed all facts that don't have embeddings yet.
@@ -1733,11 +1733,11 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             )
 
             if not missing_ids:
-                logger.debug("holographic_plus: all %d facts already have embeddings", len(all_ids))
+                logger.debug("enfold: all %d facts already have embeddings", len(all_ids))
                 return
 
             logger.info(
-                "holographic_plus: backfilling embeddings for %d/%d facts",
+                "enfold: backfilling embeddings for %d/%d facts",
                 len(missing_ids), len(all_ids),
             )
 
@@ -1756,7 +1756,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
             for i in range(0, len(pending), _BATCH):
                 if stop is not None and stop.is_set():
                     logger.debug(
-                        "holographic_plus: backfill stopped early (%d embeddings added)",
+                        "enfold: backfill stopped early (%d embeddings added)",
                         count,
                     )
                     return
@@ -1767,7 +1767,7 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                         [self._embed_text(c, "document") for c in contents]
                     )
                 except Exception as exc:
-                    logger.debug("holographic_plus backfill: batch embed failed: %s", exc)
+                    logger.debug("enfold backfill: batch embed failed: %s", exc)
                     continue
                 for (fid, _content), vec in zip(chunk, vecs):
                     if vec is None:
@@ -1780,12 +1780,12 @@ class HolographicPlusProvider(HolographicMemoryProvider):
                         )
                         count += 1
                     except Exception as exc:
-                        logger.debug("holographic_plus backfill: fact %d upsert failed: %s", fid, exc)
+                        logger.debug("enfold backfill: fact %d upsert failed: %s", fid, exc)
 
-            logger.info("holographic_plus: backfill complete, %d embeddings added", count)
+            logger.info("enfold: backfill complete, %d embeddings added", count)
 
         except Exception as exc:
-            logger.warning("holographic_plus: backfill thread failed: %s", exc)
+            logger.warning("enfold: backfill thread failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1824,7 +1824,7 @@ def _load_plugin_config() -> dict:
 
 
 def register(ctx) -> None:
-    """Register holographic_plus memory provider with the plugin system."""
+    """Register enfold memory provider with the plugin system."""
     config = _load_plugin_config()
-    provider = HolographicPlusProvider(config=config)
+    provider = EnfoldProvider(config=config)
     ctx.register_memory_provider(provider)

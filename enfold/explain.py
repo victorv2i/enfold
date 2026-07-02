@@ -9,7 +9,7 @@ ranked past the limit).
 
 Usage::
 
-    python -m holographic_plus.explain /path/to/facts-copy.db "query text"
+    python -m enfold.explain /path/to/facts-copy.db "query text"
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import os
 import sys
 from typing import Optional, Sequence
 
-from . import HolographicPlusProvider
+from . import EnfoldProvider
 
 
 class GuardRailError(Exception):
@@ -66,7 +66,7 @@ def explain(
         "embedding_prefix_policy": embedding_prefix_policy,
         "hrr_dim": hrr_dim,
     }
-    provider = HolographicPlusProvider(config=config)
+    provider = EnfoldProvider(config=config)
     try:
         provider.initialize("explain-cli")
         return provider.explain_search(query, limit=limit)

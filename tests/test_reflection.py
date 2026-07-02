@@ -19,7 +19,7 @@ import pytest
 
 import fake_hermes
 
-from holographic_plus.reflection import (
+from enfold.reflection import (
     ensure_reflection_schema,
     get_last_run_at,
     set_last_run_at,
@@ -29,8 +29,8 @@ from holographic_plus.reflection import (
     run_reflection,
     invalidate_insights_citing,
 )
-from holographic_plus.embed_store import EmbedStore
-from holographic_plus.temporal import ensure_temporal_schema, supersede
+from enfold.embed_store import EmbedStore
+from enfold.temporal import ensure_temporal_schema, supersede
 
 
 # ---------------------------------------------------------------------------

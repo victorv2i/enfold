@@ -1,4 +1,4 @@
-from holographic_plus.llm_extract import _parse_response
+from enfold.llm_extract import _parse_response
 
 
 def test_parse_valid_array():

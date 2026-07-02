@@ -1,5 +1,5 @@
-holographic_plus
-================
+Enfold
+======
 
 A hybrid long-term memory provider for Hermes Agent: it extends the holographic
 (HRR) fact store with dense semantic embeddings and LLM-based fact extraction,
@@ -10,7 +10,7 @@ This project builds on prior work, gratefully credited:
 - The base holographic memory provider (the `MemoryProvider` integration, the
   HRR (Holographic Reduced Representations) retrieval, the SQLite fact store,
   trust scoring, and entity resolution) was created by **dusterbloom** for
-  NousResearch/hermes-agent (PR #2351) and is licensed MIT. holographic_plus
+  NousResearch/hermes-agent (PR #2351) and is licensed MIT. Enfold
   subclasses it; all credit for the holographic foundation is theirs.
 
 - Holographic Reduced Representations, the vector-symbolic technique underlying

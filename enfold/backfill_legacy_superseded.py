@@ -1,13 +1,13 @@
 """Offline backfill: convert legacy 'SUPERSEDED <date>:' facts to structural invalid_at.
 
-Standalone maintenance script for a ``holographic_plus`` SQLite fact store,
+Standalone maintenance script for a ``enfold`` SQLite fact store,
 mirroring ``cluster_merge.py``'s conventions: dry-run by default, refuses a
 live ``.hermes`` path, meant to run against a copy of a fact store.
 
 Before temporal validity existed, a retired fact was marked by rewriting its
 content with a ``SUPERSEDED <date>:`` / ``STALE/DISABLED <date>:`` /
 ``Historical/superseded <date>:`` prefix (``_is_superseded`` in
-``holographic_plus/__init__.py``), and search excluded it by string-matching
+``enfold/__init__.py``), and search excluded it by string-matching
 that prefix. This backfill converts each matching row to the structural
 convention (``invalid_at`` set) going forward, WITHOUT rewriting content, so
 the original wording is preserved for history/audit. There is no reliable way
@@ -36,7 +36,7 @@ class GuardRailError(Exception):
 
 
 def _is_legacy_superseded(content: str) -> bool:
-    """Same prefix rule as ``holographic_plus._is_superseded``, kept in sync
+    """Same prefix rule as ``enfold._is_superseded``, kept in sync
     intentionally rather than imported, so this maintenance script has no
     runtime dependency on the plugin package."""
     return (content or "").lstrip().lower().startswith(_SUPERSEDED_PREFIXES)

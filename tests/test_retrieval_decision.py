@@ -1,4 +1,4 @@
-"""Calibrated retrieval decision gates for Holographic+ search."""
+"""Calibrated retrieval decision gates for Enfold search."""
 
 import numpy as np
 

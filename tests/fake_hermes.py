@@ -1,4 +1,4 @@
-"""Stand-ins for the hermes internals that holographic_plus imports.
+"""Stand-ins for the hermes internals that enfold imports.
 
 Installs sys.modules stubs for:
 

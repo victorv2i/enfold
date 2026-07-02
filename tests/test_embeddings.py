@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from holographic_plus.embeddings import (
+from enfold.embeddings import (
     FastEmbedder,
     OllamaEmbedder,
     bytes_to_embedding,

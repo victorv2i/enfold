@@ -6,7 +6,7 @@ import sqlite3
 import numpy as np
 import pytest
 
-from holographic_plus.embed_store import EmbedStore
+from enfold.embed_store import EmbedStore
 
 _CUR = "fastembed:bge-large:document:none:v1"
 _OLD = "fastembed:bge-base:document:none:v1"

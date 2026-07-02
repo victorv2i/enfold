@@ -1,8 +1,8 @@
-"""Tests for the MCP server's provider factory (holographic_plus.mcp_provider).
+"""Tests for the MCP server's provider factory (enfold.mcp_provider).
 
 Covers: resolving the parent hermes modules (real checkout via
-HOLOPLUS_HERMES_SRC, else the bundled fake_hermes stubs), building a
-HolographicPlusProvider against a configurable db_path/config, and the
+ENFOLD_HERMES_SRC, else the bundled fake_hermes stubs), building a
+EnfoldProvider against a configurable db_path/config, and the
 journal_mode/busy_timeout concurrency settings the shared-DB use case needs.
 """
 
@@ -17,15 +17,15 @@ from pathlib import Path
 import pytest
 
 # mcp_provider.py decides which parent hermes modules to load (real checkout
-# vs fake_hermes stubs) BEFORE holographic_plus itself is ever imported. A
-# plain `from holographic_plus import mcp_provider` would run
-# holographic_plus/__init__.py first (Python package import semantics),
+# vs fake_hermes stubs) BEFORE enfold itself is ever imported. A
+# plain `from enfold import mcp_provider` would run
+# enfold/__init__.py first (Python package import semantics),
 # which does its own unconditional `from plugins.memory.holographic import
 # ...` at module level, resolving to whatever is already importable (e.g. a
 # separate hermes-agent install on sys.path) before mcp_provider gets a say.
 # Load it directly from its file instead, same technique conftest.py and
 # test_real_parent_equivalence.py already use for the plugin package itself.
-_MCP_PROVIDER_PATH = Path(__file__).resolve().parents[1] / "holographic_plus" / "mcp_provider.py"
+_MCP_PROVIDER_PATH = Path(__file__).resolve().parents[1] / "enfold" / "mcp_provider.py"
 
 
 def _load_mcp_provider():
@@ -44,20 +44,20 @@ mcp_provider = _load_mcp_provider()
 
 def test_resolve_parent_modules_falls_back_to_fake_hermes(monkeypatch):
     """With no real hermes checkout configured, the fake_hermes stubs are used."""
-    monkeypatch.delenv("HOLOPLUS_HERMES_SRC", raising=False)
+    monkeypatch.delenv("ENFOLD_HERMES_SRC", raising=False)
     used = mcp_provider.resolve_parent_modules()
     assert used == "fake_hermes"
 
 
 def test_resolve_parent_modules_real_src_missing_falls_back(monkeypatch, tmp_path):
-    """A configured but nonexistent HOLOPLUS_HERMES_SRC falls back, doesn't raise."""
-    monkeypatch.setenv("HOLOPLUS_HERMES_SRC", str(tmp_path / "does-not-exist"))
+    """A configured but nonexistent ENFOLD_HERMES_SRC falls back, doesn't raise."""
+    monkeypatch.setenv("ENFOLD_HERMES_SRC", str(tmp_path / "does-not-exist"))
     used = mcp_provider.resolve_parent_modules()
     assert used == "fake_hermes"
 
 
 def test_build_provider_uses_configurable_db_path(tmp_path, monkeypatch):
-    monkeypatch.delenv("HOLOPLUS_HERMES_SRC", raising=False)
+    monkeypatch.delenv("ENFOLD_HERMES_SRC", raising=False)
     db_path = tmp_path / "facts.db"
     provider = mcp_provider.build_provider(
         db_path=str(db_path),
@@ -72,7 +72,7 @@ def test_build_provider_uses_configurable_db_path(tmp_path, monkeypatch):
 
 def test_build_provider_defaults_match_live_ollama_identity(tmp_path, monkeypatch):
     """Defaults mirror the live box: ollama backend, embeddinggemma model, auto prefix."""
-    monkeypatch.delenv("HOLOPLUS_HERMES_SRC", raising=False)
+    monkeypatch.delenv("ENFOLD_HERMES_SRC", raising=False)
     provider = mcp_provider.build_provider(
         db_path=str(tmp_path / "facts.db"),
         embedding_backend="fake",
@@ -95,7 +95,7 @@ def test_build_provider_defaults_match_live_ollama_identity(tmp_path, monkeypatc
 
 def test_build_provider_sets_busy_timeout(tmp_path, monkeypatch):
     """The store connection must have a busy_timeout for concurrent writers."""
-    monkeypatch.delenv("HOLOPLUS_HERMES_SRC", raising=False)
+    monkeypatch.delenv("ENFOLD_HERMES_SRC", raising=False)
     db_path = tmp_path / "facts.db"
     provider = mcp_provider.build_provider(
         db_path=str(db_path),
@@ -111,7 +111,7 @@ def test_build_provider_sets_busy_timeout(tmp_path, monkeypatch):
 
 
 def test_build_provider_journal_mode_is_wal(tmp_path, monkeypatch):
-    monkeypatch.delenv("HOLOPLUS_HERMES_SRC", raising=False)
+    monkeypatch.delenv("ENFOLD_HERMES_SRC", raising=False)
     db_path = tmp_path / "facts.db"
     provider = mcp_provider.build_provider(
         db_path=str(db_path),
@@ -139,7 +139,7 @@ def test_check_journal_mode_reads_existing_db(tmp_path):
 
 
 _REAL_HERMES_SRC = os.environ.get(
-    "HOLOPLUS_HERMES_SRC", str(Path.home() / "hermes-migration-stage" / "src")
+    "ENFOLD_HERMES_SRC", str(Path.home() / "hermes-migration-stage" / "src")
 )
 _REAL_HOLO_DIR = Path(_REAL_HERMES_SRC) / "plugins" / "memory" / "holographic"
 
@@ -153,10 +153,10 @@ def test_resolve_parent_modules_real_checkout_resolves_to_real(monkeypatch):
 
     Runs in-process against whatever the module-level cache currently holds;
     the important assertion is that it names "real" the source it found,
-    not "fake_hermes", when HOLOPLUS_HERMES_SRC points at a genuine checkout.
+    not "fake_hermes", when ENFOLD_HERMES_SRC points at a genuine checkout.
     This exercises the same code path used on the live box.
     """
-    monkeypatch.setenv("HOLOPLUS_HERMES_SRC", _REAL_HERMES_SRC)
+    monkeypatch.setenv("ENFOLD_HERMES_SRC", _REAL_HERMES_SRC)
     # Run in a subprocess so the module-level sys.modules cache from earlier
     # tests in this file (which install the fake stubs) cannot mask a real
     # resolution failure.

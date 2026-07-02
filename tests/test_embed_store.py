@@ -2,7 +2,7 @@ import sqlite3
 
 import numpy as np
 
-from holographic_plus.embed_store import EmbedStore
+from enfold.embed_store import EmbedStore
 
 _DOC = "test:model:document:none:v1"
 _QUERY = "test:model:query:none:v1"

@@ -1,1 +1,1 @@
-"""Read-only evaluation helpers for Holographic+ memory."""
+"""Read-only evaluation helpers for Enfold memory."""

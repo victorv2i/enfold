@@ -1,8 +1,8 @@
-"""Standalone test harness for holographic_plus.
+"""Standalone test harness for enfold.
 
 Runs without a hermes install on the path and without network access:
 fake_hermes injects sys.modules stubs for the hermes internals, the plugin
-package is then loaded from the holographic_plus/ directory, and all databases
+package is then loaded from the enfold/ directory, and all databases
 live in pytest temp dirs. Run from the repo root with:
 
     pytest tests/
@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 TESTS_DIR = Path(__file__).resolve().parent
-PLUGIN_DIR = TESTS_DIR.parent / "holographic_plus"
+PLUGIN_DIR = TESTS_DIR.parent / "enfold"
 
 sys.path.insert(0, str(TESTS_DIR))
 
@@ -28,7 +28,7 @@ fake_hermes.install_stubs()
 
 
 def _load_plugin():
-    name = "holographic_plus"
+    name = "enfold"
     if name in sys.modules:
         return sys.modules[name]
     spec = importlib.util.spec_from_file_location(
@@ -47,7 +47,7 @@ _hp = _load_plugin()
 
 @pytest.fixture(scope="session")
 def hp():
-    """The holographic_plus package loaded against the fakes."""
+    """The enfold package loaded against the fakes."""
     return _hp
 
 
@@ -74,7 +74,7 @@ class _ProviderFactory:
         config.update(cfg)
         fake = embedder or fake_hermes.FakeEmbedder()
 
-        class _TestProvider(self._hp.HolographicPlusProvider):
+        class _TestProvider(self._hp.EnfoldProvider):
             def _create_embedder(self):
                 return fake
 

@@ -13,7 +13,7 @@ import sqlite3
 import numpy as np
 import pytest
 
-from holographic_plus.cluster_merge import (
+from enfold.cluster_merge import (
     build_clusters,
     choose_survivor,
     plan_merge,

@@ -1,6 +1,6 @@
 """Write-time near-duplicate guard, blend scoring, and FTS query sanitization."""
 
-from holographic_plus import (
+from enfold import (
     _is_near_duplicate,
     _is_semantic_duplicate,
     _is_superseded,

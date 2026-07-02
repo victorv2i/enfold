@@ -26,7 +26,7 @@ def test_wal_checkpoint_truncates_the_wal_file(make_provider, tmp_path):
 
 
 def test_wal_checkpoint_safe_without_store(hp):
-    provider = hp.HolographicPlusProvider(config={})
+    provider = hp.EnfoldProvider(config={})
     assert provider._wal_checkpoint() is None
 
 

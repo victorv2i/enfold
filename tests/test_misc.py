@@ -4,15 +4,15 @@ import ast
 import json
 from pathlib import Path
 
-PLUGIN_DIR = Path(__file__).resolve().parents[1] / "holographic_plus"
+PLUGIN_DIR = Path(__file__).resolve().parents[1] / "enfold"
 PLUGIN_SOURCES = sorted(PLUGIN_DIR.glob("*.py"))
 
 
 def test_smoke_import_surface(hp):
     assert callable(hp.register)
-    assert hasattr(hp, "HolographicPlusProvider")
-    provider = hp.HolographicPlusProvider(config={"embedding_weight": 0.3})
-    assert provider.name == "holographic_plus"
+    assert hasattr(hp, "EnfoldProvider")
+    provider = hp.EnfoldProvider(config={"embedding_weight": 0.3})
+    assert provider.name == "enfold"
     assert provider._embed_weight == 0.3
     # Constructing must not create stores, threads, or pools
     assert provider._store is None
@@ -90,5 +90,5 @@ def test_prefetch_renders_results(make_provider):
     provider = make_provider()
     provider._store.add_fact("The user prefers pnpm for node projects", category="tool")
     block = provider.prefetch("pnpm projects")
-    assert block.startswith("## Holographic+ Memory")
+    assert block.startswith("## Enfold Memory")
     assert "pnpm" in block

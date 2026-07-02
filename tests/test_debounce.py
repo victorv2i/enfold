@@ -100,6 +100,6 @@ def test_seam_restores_on_exception(make_provider):
 
 
 def test_noop_when_store_missing(hp):
-    provider = hp.HolographicPlusProvider(config={})
+    provider = hp.EnfoldProvider(config={})
     with provider._deferred_bank_rebuild():
         pass  # must not raise without an initialized store

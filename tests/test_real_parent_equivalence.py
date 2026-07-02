@@ -30,7 +30,7 @@ HERMES_ROOT = Path(
     os.environ.get("HERMES_AGENT_ROOT", str(Path.home() / "hermes-agent"))
 )
 HOLO_DIR = HERMES_ROOT / "plugins" / "memory" / "holographic"
-PLUGIN_DIR = Path(__file__).resolve().parents[1] / "holographic_plus"
+PLUGIN_DIR = Path(__file__).resolve().parents[1] / "enfold"
 
 if not (HOLO_DIR / "retrieval.py").exists():
     pytest.skip(

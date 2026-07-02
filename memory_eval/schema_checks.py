@@ -71,7 +71,7 @@ def inspect_memory_schema(
     *,
     current_embedding_identity: str | None = None,
 ) -> dict[str, Any]:
-    """Inspect a copied Holographic+ SQLite DB for SOTA memory readiness gates."""
+    """Inspect a copied Enfold SQLite DB for SOTA memory readiness gates."""
     with closing(connect_readonly(db_path)) as conn:
         tables = _tables(conn)
         fact_columns = _columns(conn, "facts")

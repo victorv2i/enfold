@@ -1,4 +1,4 @@
-"""Embedding clients and serialization helpers for holographic_plus.
+"""Embedding clients and serialization helpers for enfold.
 
 Provides:
   - OllamaEmbedder: thin HTTP client for the /api/embed endpoint

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recall benchmark for holographic_plus.
+"""Recall benchmark for enfold.
 
 Question it answers: does the dense-embedding layer recover facts that a
 keyword baseline misses? It seeds a synthetic corpus into the *real* EmbedStore,
@@ -34,8 +34,8 @@ import fake_hermes  # noqa: E402
 
 fake_hermes.install_stubs()
 
-from holographic_plus.embed_store import EmbedStore  # noqa: E402
-from holographic_plus.embeddings import FastEmbedder  # noqa: E402
+from enfold.embed_store import EmbedStore  # noqa: E402
+from enfold.embeddings import FastEmbedder  # noqa: E402
 
 CORPUS = [
     "The user prefers dark mode in their code editor.",
@@ -155,7 +155,7 @@ def main() -> int:
         hybrid = {i: 0.4 * kw_n[i] + 0.6 * emb_n.get(i, 0.0) for i in range(len(CORPUS))}
         hyb_ranked.append(_ranked(hybrid))
 
-    print(f"holographic_plus recall benchmark: {len(CORPUS)} facts, {len(QUERIES)} paraphrased queries\n")
+    print(f"enfold recall benchmark: {len(CORPUS)} facts, {len(QUERIES)} paraphrased queries\n")
     header = f"{'retriever':<12} {'recall@1':>9} {'recall@3':>9} {'recall@5':>9} {'MRR':>7}"
     print(header)
     print("-" * len(header))

@@ -91,10 +91,10 @@ def test_cli_smoke_prints_breakdown(tmp_path, hp):
 
     result = subprocess.run(
         [
-            sys.executable, "-m", "holographic_plus.explain", str(db_path), "Postgres preference",
+            sys.executable, "-m", "enfold.explain", str(db_path), "Postgres preference",
             "--ollama-url", "http://127.0.0.1:1", "--hrr-dim", "64",
         ],
-        cwd=str(hp.__file__.rsplit("/holographic_plus/", 1)[0]),
+        cwd=str(hp.__file__.rsplit("/enfold/", 1)[0]),
         capture_output=True,
         text=True,
     )
@@ -106,7 +106,7 @@ def test_cli_smoke_prints_breakdown(tmp_path, hp):
 
 
 def test_cli_refuses_hermes_path(tmp_path):
-    from holographic_plus.explain import main
+    from enfold.explain import main
 
     fake_db = tmp_path / ".hermes" / "facts.db"
     fake_db.parent.mkdir(parents=True)

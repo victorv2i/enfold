@@ -101,7 +101,7 @@ class EmbedStore:
     def _ensure_schema_v2(self) -> None:
         """Migrate legacy one-vector-per-fact tables to identity-scoped rows.
 
-        Older Holographic+ builds used ``fact_id`` as the primary key and later
+        Older Enfold builds used ``fact_id`` as the primary key and later
         added nullable ``embedding_identity`` metadata. That was safe for
         filtering, but not for side-by-side model shadowing because a second
         model would overwrite the first. Schema v2 uses a composite primary key

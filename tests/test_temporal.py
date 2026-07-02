@@ -14,7 +14,7 @@ import threading
 
 import pytest
 
-from holographic_plus.temporal import (
+from enfold.temporal import (
     ensure_temporal_schema,
     _is_value_update,
     find_value_update_target,

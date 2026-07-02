@@ -1,4 +1,4 @@
-"""Stdio MCP server exposing holographic_plus as a shared-memory tool set.
+"""Stdio MCP server exposing enfold as a shared-memory tool set.
 
 Lets other coding agents (Claude Code, Codex CLI) read and write the same
 fact store the Hermes gateway uses in-process, over the Model Context
@@ -17,10 +17,10 @@ in --read-only mode (registered but return errors is NOT the read-only
 contract here: the tools simply do not exist, so a read-only client can
 never even attempt one).
 
-Run directly (run the file by path, NOT `python -m holographic_plus.mcp_server`;
+Run directly (run the file by path, NOT `python -m enfold.mcp_server`;
 see the warning below for why):
 
-    python holographic_plus/mcp_server.py \\
+    python enfold/mcp_server.py \\
         --db-path ~/.hermes/memory_store.db \\
         --ollama-url http://localhost:11434 \\
         --ollama-model embeddinggemma:latest
@@ -29,16 +29,16 @@ See mcp_provider.py for how the parent hermes modules and db connection are
 resolved and configured.
 
 IMPORTANT -- run this file by path, never via `-m`: importing
-holographic_plus as a package (``python -m holographic_plus.mcp_server``, or
-any ``import holographic_plus`` before this module has resolved its parent)
-runs holographic_plus/__init__.py first, Python's own package-import
+enfold as a package (``python -m enfold.mcp_server``, or
+any ``import enfold`` before this module has resolved its parent)
+runs enfold/__init__.py first, Python's own package-import
 semantics, and that file does its own unconditional
 ``from plugins.memory.holographic import HolographicMemoryProvider`` at
 module level. On a host with a *separate* Hermes install already on
 sys.path (e.g. a pip-installed hermes-agent), that import silently wins the
-race and this module's own HOLOPLUS_HERMES_SRC resolution never gets a
+race and this module's own ENFOLD_HERMES_SRC resolution never gets a
 chance to run. Executing this file directly (``python
-holographic_plus/mcp_server.py ...``) sidesteps the package __init__.py
+enfold/mcp_server.py ...``) sidesteps the package __init__.py
 entirely, which is why every example here uses the file path.
 """
 
@@ -61,14 +61,14 @@ except ImportError:  # pragma: no cover - posix-only; this server targets Linux
 _THIS_DIR = Path(__file__).resolve().parent
 
 # mcp_provider decides which parent hermes modules to load (real checkout vs
-# the bundled fake_hermes stubs) and must run BEFORE holographic_plus itself
-# is imported as a package, since `import holographic_plus` runs its
+# the bundled fake_hermes stubs) and must run BEFORE enfold itself
+# is imported as a package, since `import enfold` runs its
 # __init__.py, which does its own unconditional parent import at module
 # level. Load it by file path so this module never triggers that.
 
 
 def _load_mcp_provider():
-    name = "_holographic_plus_mcp_provider"
+    name = "_enfold_mcp_provider"
     if name in sys.modules:
         return sys.modules[name]
     spec = importlib.util.spec_from_file_location(name, _THIS_DIR / "mcp_provider.py")
@@ -84,7 +84,7 @@ try:
     from mcp.server.fastmcp import FastMCP
 except ImportError as exc:  # pragma: no cover - exercised only without the dep
     raise ImportError(
-        "The 'mcp' package is required to run the holographic_plus MCP server "
+        "The 'mcp' package is required to run the enfold MCP server "
         "(pip install mcp). It is an optional dependency of this repo, only "
         "needed for mcp_server.py / mcp_provider.py, not for the Hermes plugin "
         "itself."
@@ -100,7 +100,7 @@ _T = TypeVar("_T")
 def _cross_process_write_lock(db_path: str) -> Iterator[None]:
     """Serialize writers across separate MCP server processes sharing db_path.
 
-    A holographic_plus write (dedup search, insert, HRR bank rebuild,
+    A enfold write (dedup search, insert, HRR bank rebuild,
     optional supersession) is several separate short SQLite transactions,
     not one. SQLite's own busy_timeout retries a single blocked statement,
     but it cannot make that whole multi-statement sequence atomic across two
@@ -183,13 +183,13 @@ def _tag_source(tags: str, source: str) -> str:
 
 
 def build_server(provider, read_only: bool = False) -> "FastMCP":
-    """Register holographic_plus tools against *provider* and return the FastMCP app.
+    """Register enfold tools against *provider* and return the FastMCP app.
 
     *provider* must already be initialized (see mcp_provider.build_provider).
     When *read_only* is true, memory_add and memory_supersede are never
     registered at all.
     """
-    server = FastMCP("holographic-plus-memory")
+    server = FastMCP("enfold-memory")
     db_path = str(provider._store.db_path)
 
     @server.tool()
@@ -310,7 +310,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--hermes-src",
         default=None,
         help="path to a hermes source checkout providing plugins.memory.holographic "
-        "(default: $HOLOPLUS_HERMES_SRC or ~/hermes-migration-stage/src)",
+        "(default: $ENFOLD_HERMES_SRC or ~/hermes-migration-stage/src)",
     )
     parser.add_argument("--embedding-backend", default="ollama",
                          help="ollama or fastembed (default ollama)")

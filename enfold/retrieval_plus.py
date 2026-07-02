@@ -1,4 +1,4 @@
-"""Faster drop-in FactRetriever for holographic_plus.
+"""Faster drop-in FactRetriever for enfold.
 
 Two hot-path fixes over the parent retriever, with scoring semantics kept
 identical:

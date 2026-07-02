@@ -17,7 +17,7 @@ import types
 
 import numpy as np
 
-from holographic_plus.llm_extract import insert_facts
+from enfold.llm_extract import insert_facts
 
 
 def _llm_response(content):
@@ -112,7 +112,7 @@ def test_semantic_gate_catches_paraphrase_with_low_jaccard(make_provider):
     _add_with_embedding(provider, a, "user_pref", shared_vec)
     provider._fake_embedder.table[b] = np.asarray(shared_vec, dtype=np.float32)
 
-    from holographic_plus import _jaccard, _norm_tokens
+    from enfold import _jaccard, _norm_tokens
     assert _jaccard(_norm_tokens(a), _norm_tokens(b)) < 0.5, "test fixture must be a low-Jaccard paraphrase"
 
     dup = provider._find_near_duplicate(b, category="user_pref")

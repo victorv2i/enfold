@@ -31,8 +31,8 @@ def _load(name: str, path: Path):
 def main() -> int:
     db_path, thread_id, n_facts = sys.argv[1], sys.argv[2], int(sys.argv[3])
 
-    mcp_provider = _load("_worker_mcp_provider", _REPO_ROOT / "holographic_plus" / "mcp_provider.py")
-    mcp_server = _load("_worker_mcp_server", _REPO_ROOT / "holographic_plus" / "mcp_server.py")
+    mcp_provider = _load("_worker_mcp_provider", _REPO_ROOT / "enfold" / "mcp_provider.py")
+    mcp_server = _load("_worker_mcp_server", _REPO_ROOT / "enfold" / "mcp_server.py")
 
     provider = mcp_provider.build_provider(
         db_path=db_path, embedding_backend="fake", hrr_dim=64, busy_timeout_ms=5000,

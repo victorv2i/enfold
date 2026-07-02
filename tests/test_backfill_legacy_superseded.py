@@ -11,7 +11,7 @@ import sqlite3
 
 import pytest
 
-from holographic_plus.backfill_legacy_superseded import (
+from enfold.backfill_legacy_superseded import (
     plan_backfill,
     execute_backfill,
     GuardRailError,
@@ -137,7 +137,7 @@ def test_execute_backfill_sets_invalid_at_without_rewriting_content(tmp_path):
 
 def test_execute_backfill_refuses_live_hermes_path():
     with pytest.raises(GuardRailError):
-        execute_backfill("/home/user/.hermes/holographic_plus.db", dry_run=False)
+        execute_backfill("/home/user/.hermes/enfold.db", dry_run=False)
 
 
 def test_execute_backfill_requires_temporal_schema(tmp_path):

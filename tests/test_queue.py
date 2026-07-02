@@ -224,9 +224,9 @@ def test_restart_drains_rows_left_by_previous_run(hp, make_provider, aux_module,
 
 def test_wal_checkpoint_runs_after_successful_batch(hp, make_provider, aux_module, waiter, monkeypatch):
     calls = []
-    original = hp.HolographicPlusProvider._wal_checkpoint
+    original = hp.EnfoldProvider._wal_checkpoint
     monkeypatch.setattr(
-        hp.HolographicPlusProvider,
+        hp.EnfoldProvider,
         "_wal_checkpoint",
         lambda self: calls.append(True) or original(self),
     )

@@ -1,6 +1,6 @@
-# holographic_plus
+# Enfold
 
-A hybrid long-term memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+Enfold. Every memory enfolds the whole. A hybrid long-term memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
 It extends the bundled **holographic** (HRR) fact store with **dense semantic embeddings** and **LLM-based fact extraction**, then merges every signal in a single hybrid retrieval pass, so the agent recalls facts by *meaning*, not just keyword overlap, while keeping the holographic store's symbolic strengths.
 
@@ -28,14 +28,14 @@ It does not replace the holographic provider, it subclasses it. All the holograp
 Hermes auto-discovers any memory-provider directory under `~/.hermes/plugins/`, so installation is a copy:
 
 ```bash
-git clone https://github.com/victorv2i/holographic-plus.git
-cp -r holographic-plus/holographic_plus ~/.hermes/plugins/
+git clone https://github.com/victorv2i/enfold.git
+cp -r enfold ~/.hermes/plugins/
 ```
 
 Then select it as your provider:
 
 ```bash
-hermes config set memory.provider holographic_plus
+hermes config set memory.provider enfold
 ```
 
 ## Configuration
@@ -115,7 +115,7 @@ It inherits the base `fact_store` tool (add / search / probe / related / reason 
 
 ## MCP server
 
-`holographic_plus/mcp_server.py` exposes the same fact store over the Model
+`enfold/mcp_server.py` exposes the same fact store over the Model
 Context Protocol (stdio transport), so a coding agent that isn't Hermes (Claude
 Code, Codex CLI) can read and write it directly, while the Hermes gateway keeps
 using the store in-process as usual. Both sides see the same facts because
@@ -127,7 +127,7 @@ third, and fifth (the two writes, `memory_add` and `memory_supersede`, are
 never registered at all in this mode, not just blocked at call time).
 
 The `mcp` package (FastMCP) is an optional dependency, only needed to run this
-server, never to import `holographic_plus` as a Hermes plugin:
+server, never to import `enfold` as a Hermes plugin:
 
 ```bash
 pip install mcp
@@ -136,19 +136,19 @@ pip install mcp
 Run the server **by file path**, not with `-m`:
 
 ```bash
-python holographic_plus/mcp_server.py \
+python enfold/mcp_server.py \
     --db-path ~/.hermes/memory_store.db \
     --ollama-url http://localhost:11434 \
     --ollama-model embeddinggemma:latest
 ```
 
-`python -m holographic_plus.mcp_server` (or anything that imports
-`holographic_plus` as a package before this module resolves its own parent
-Hermes checkout) triggers `holographic_plus/__init__.py`'s unconditional
+`python -m enfold.mcp_server` (or anything that imports
+`enfold` as a package before this module resolves its own parent
+Hermes checkout) triggers `enfold/__init__.py`'s unconditional
 `plugins.memory.holographic` import at module load time. On a host with a
 second, unrelated Hermes install already on `sys.path`, that import can win
 silently and this module never gets to point at the checkout you actually
-meant (`HOLOPLUS_HERMES_SRC`, see `mcp_provider.py`). Running the file
+meant (`ENFOLD_HERMES_SRC`, see `mcp_provider.py`). Running the file
 directly sidesteps `__init__.py` entirely, which is why every example here
 uses the file path.
 
@@ -167,7 +167,7 @@ returned instead of storing again, and a genuine value update (same wording,
 a changed number/id/state word) supersedes the prior fact automatically.
 
 Concurrency: the store runs in SQLite WAL mode with `busy_timeout` set on the
-connection, and a holographic_plus write is several separate short
+connection, and a enfold write is several separate short
 transactions (dedup search, insert, bank rebuild, optional supersession), not
 one, so `busy_timeout` alone cannot make that whole sequence atomic across two
 processes. Every MCP write additionally takes an OS advisory file lock
@@ -226,7 +226,7 @@ MIT, see [LICENSE](LICENSE).
 
 ### 0.6.0
 
-- Stdio MCP server (`holographic_plus/mcp_server.py` + `mcp_provider.py`) shares
+- Stdio MCP server (`enfold/mcp_server.py` + `mcp_provider.py`) shares
   the fact store with other coding agents (Claude Code, Codex CLI) over the
   Model Context Protocol, while the Hermes gateway keeps using it in-process.
   Optional `mcp` dependency, source-tagged writes through the same dedup and

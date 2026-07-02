@@ -22,7 +22,7 @@ class PreparedEvalDb:
 
 
 def production_like_config(db_path: str | Path) -> dict[str, Any]:
-    """Return the current tested local-first Holographic+ config for a DB copy."""
+    """Return the current tested local-first Enfold config for a DB copy."""
     return {
         "db_path": str(Path(db_path)),
         "embedding_backend": "ollama",
@@ -51,7 +51,7 @@ def resolve_cases(
 def prepare_eval_db(db_path: str | Path, scratch_db: str | Path) -> PreparedEvalDb:
     """Create the writable DB snapshot used by the provider during eval.
 
-    HolographicPlusProvider opens a normal SQLite connection on initialize().
+    EnfoldProvider opens a normal SQLite connection on initialize().
     Even with `bump=False`, the safest boundary is therefore: never hand the
     provider the operator-supplied path. Always run on a fresh backup-API copy.
     """
@@ -63,7 +63,7 @@ def clear_pending_extract_queue_for_eval(db_path: str | Path) -> int:
     """Delete pending extraction rows from the scratch DB before loading provider.
 
     The eval runner snapshots first, then measures schema state. If the snapshot
-    contains a pending extraction row, initializing HolographicPlusProvider would
+    contains a pending extraction row, initializing EnfoldProvider would
     start its background worker and may drain that row on the scratch DB. Eval
     retrieval does not need extraction side effects, so clear only the scratch
     copy after measurement and before provider initialization.
@@ -101,16 +101,16 @@ def _install_test_stubs(repo_root: Path) -> None:
 
 
 def load_provider(repo_root: Path, config: dict[str, Any], *, hermes_src: Path | None, test_stubs: bool):
-    """Load the repo's Holographic+ provider with either real Hermes or test stubs."""
+    """Load the repo's Enfold provider with either real Hermes or test stubs."""
     sys.path.insert(0, str(repo_root))
     if hermes_src is not None:
         sys.path.insert(0, str(hermes_src))
     if test_stubs:
         _install_test_stubs(repo_root)
 
-    from holographic_plus import HolographicPlusProvider
+    from enfold import EnfoldProvider
 
-    provider = HolographicPlusProvider(config=config)
+    provider = EnfoldProvider(config=config)
     provider.initialize("memory-eval-baseline")
     return provider
 
@@ -201,7 +201,7 @@ def run_baseline(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run Holographic+ read-only memory baseline on a SQLite DB snapshot.")
+    parser = argparse.ArgumentParser(description="Run Enfold read-only memory baseline on a SQLite DB snapshot.")
     parser.add_argument("--db", required=True, help="Input SQLite memory_store.db; copied to a scratch DB before provider use")
     parser.add_argument("--out", required=True, help="Path to write JSON report")
     parser.add_argument("--scratch-db", help="Writable snapshot path; defaults to OUT with .db suffix")

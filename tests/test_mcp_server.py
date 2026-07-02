@@ -1,4 +1,4 @@
-"""Tests for the holographic_plus MCP tool server (holographic_plus.mcp_server).
+"""Tests for the enfold MCP tool server (enfold.mcp_server).
 
 Exercises tool registration, search parity with provider.search(), the add
 path routing through the same dedup gate + supersession as the live write
@@ -17,8 +17,8 @@ from pathlib import Path
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_MCP_PROVIDER_PATH = _REPO_ROOT / "holographic_plus" / "mcp_provider.py"
-_MCP_SERVER_PATH = _REPO_ROOT / "holographic_plus" / "mcp_server.py"
+_MCP_PROVIDER_PATH = _REPO_ROOT / "enfold" / "mcp_provider.py"
+_MCP_SERVER_PATH = _REPO_ROOT / "enfold" / "mcp_server.py"
 
 
 def _load(name: str, path: Path):
@@ -33,7 +33,7 @@ def _load(name: str, path: Path):
 
 @pytest.fixture()
 def mcp_provider(monkeypatch):
-    monkeypatch.delenv("HOLOPLUS_HERMES_SRC", raising=False)
+    monkeypatch.delenv("ENFOLD_HERMES_SRC", raising=False)
     return _load("_hp_test_mcp_provider", _MCP_PROVIDER_PATH)
 
 
@@ -67,14 +67,14 @@ def _tool_names(server):
 
 
 def test_direct_invocation_help_does_not_crash():
-    """`python holographic_plus/mcp_server.py --help` must work standalone.
+    """`python enfold/mcp_server.py --help` must work standalone.
 
     This is the documented launch command; it must be run by file path, not
-    `python -m holographic_plus.mcp_server` (see the module docstring): a
-    package-style import runs holographic_plus/__init__.py first, which can
+    `python -m enfold.mcp_server` (see the module docstring): a
+    package-style import runs enfold/__init__.py first, which can
     silently resolve plugins.memory.holographic against an unrelated Hermes
     install already on sys.path (this box has one), before mcp_server's own
-    HOLOPLUS_HERMES_SRC resolution ever gets a chance to run.
+    ENFOLD_HERMES_SRC resolution ever gets a chance to run.
     """
     import subprocess
 
@@ -87,10 +87,10 @@ def test_direct_invocation_help_does_not_crash():
 
 
 def test_direct_invocation_resolves_configured_hermes_src(tmp_path):
-    """The file-path launch resolves HOLOPLUS_HERMES_SRC, unlike `-m` import.
+    """The file-path launch resolves ENFOLD_HERMES_SRC, unlike `-m` import.
 
     Regression guard: builds a minimal fake checkout at a custom path,
-    points HOLOPLUS_HERMES_SRC at it, and confirms mcp_server.py (run by
+    points ENFOLD_HERMES_SRC at it, and confirms mcp_server.py (run by
     file path, as documented) picks it up rather than any hermes install
     that happens to already be importable on this box.
     """

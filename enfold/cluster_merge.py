@@ -1,6 +1,6 @@
 """Offline near-duplicate cluster merge tool.
 
-Standalone maintenance script for a ``holographic_plus`` SQLite fact store.
+Standalone maintenance script for a ``enfold`` SQLite fact store.
 Clusters facts by dense-embedding cosine similarity (union-find), picks one
 survivor per cluster, merges retrieval/helpful counts and tags onto it, and
 deletes the losers. Meant to run against a *copy* of a fact store, never the
