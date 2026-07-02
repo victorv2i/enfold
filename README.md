@@ -113,6 +113,68 @@ These numbers are from one synthetic set, so treat small gaps as noise and re-ru
 
 It inherits the base `fact_store` tool (add / search / probe / related / reason / contradict / update / remove / list) and `fact_feedback` (rate facts helpful/unhelpful to train trust). The `search` action is overridden to merge dense-embedding similarity into the ranked results.
 
+## MCP server
+
+`holographic_plus/mcp_server.py` exposes the same fact store over the Model
+Context Protocol (stdio transport), so a coding agent that isn't Hermes (Claude
+Code, Codex CLI) can read and write it directly, while the Hermes gateway keeps
+using the store in-process as usual. Both sides see the same facts because
+they point at the same `db_path`.
+
+Tools registered: `memory_search`, `memory_add`, `memory_supersede`,
+`memory_explain`, `memory_history`. `--read-only` registers only the first,
+third, and fifth (the two writes, `memory_add` and `memory_supersede`, are
+never registered at all in this mode, not just blocked at call time).
+
+The `mcp` package (FastMCP) is an optional dependency, only needed to run this
+server, never to import `holographic_plus` as a Hermes plugin:
+
+```bash
+pip install mcp
+```
+
+Run the server **by file path**, not with `-m`:
+
+```bash
+python holographic_plus/mcp_server.py \
+    --db-path ~/.hermes/memory_store.db \
+    --ollama-url http://localhost:11434 \
+    --ollama-model embeddinggemma:latest
+```
+
+`python -m holographic_plus.mcp_server` (or anything that imports
+`holographic_plus` as a package before this module resolves its own parent
+Hermes checkout) triggers `holographic_plus/__init__.py`'s unconditional
+`plugins.memory.holographic` import at module load time. On a host with a
+second, unrelated Hermes install already on `sys.path`, that import can win
+silently and this module never gets to point at the checkout you actually
+meant (`HOLOPLUS_HERMES_SRC`, see `mcp_provider.py`). Running the file
+directly sidesteps `__init__.py` entirely, which is why every example here
+uses the file path.
+
+`--hrr-dim` must match the `hrr_dim` the host Hermes gateway is configured
+with for this same store. There is no auto-detection: a mismatched dimension
+does not error at startup, it crashes later, the first time HRR scoring runs
+against a vector encoded at the other dimension.
+
+Every write must carry a `source` tag, one of `claude-code`, `codex`, or
+`other`; `memory_add` and `memory_supersede` reject a call without one. The
+tag is appended to the fact's `tags` as `source:<agent>`, so it's visible
+alongside the fact everywhere tags already show up. Writes from the MCP server
+go through the exact same dedup and value-update-supersession gates as a live
+Hermes write: a near-duplicate is rejected and the existing fact's id
+returned instead of storing again, and a genuine value update (same wording,
+a changed number/id/state word) supersedes the prior fact automatically.
+
+Concurrency: the store runs in SQLite WAL mode with `busy_timeout` set on the
+connection, and a holographic_plus write is several separate short
+transactions (dedup search, insert, bank rebuild, optional supersession), not
+one, so `busy_timeout` alone cannot make that whole sequence atomic across two
+processes. Every MCP write additionally takes an OS advisory file lock
+(`flock` on a `<db_path>.mcp-write.lock` sidecar) for its whole duration, so
+writes from separate MCP server processes (e.g. one for Claude Code, one for
+Codex) are fully serialized against each other rather than racing.
+
 ## How it works
 
 - `prefetch(query)` runs the hybrid search and injects the top matches into the agent's context each turn.
@@ -161,6 +223,15 @@ The dense-embedding retrieval, LLM fact extraction, and hybrid scoring are this 
 MIT, see [LICENSE](LICENSE).
 
 ## Release notes
+
+### 0.6.0
+
+- Stdio MCP server (`holographic_plus/mcp_server.py` + `mcp_provider.py`) shares
+  the fact store with other coding agents (Claude Code, Codex CLI) over the
+  Model Context Protocol, while the Hermes gateway keeps using it in-process.
+  Optional `mcp` dependency, source-tagged writes through the same dedup and
+  supersession gates, `--read-only` mode, and cross-process write locking on
+  top of WAL + `busy_timeout`. See MCP server above.
 
 ### 0.5.1
 
