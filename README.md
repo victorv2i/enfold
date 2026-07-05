@@ -4,7 +4,7 @@
 
 <h1 align="center">Enfold</h1>
 
-<p align="center"><em>Every memory enfolds the whole.</em></p>
+<p align="center"><strong>Agent memory for builders who want recall with receipts.</strong></p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
@@ -13,28 +13,80 @@
   <img src="https://img.shields.io/badge/local--first-SQLite-044a10" alt="local-first SQLite">
 </p>
 
-Enfold is local, private, long-term memory for AI agents: one SQLite file your agents read and write through meaning-aware recall. Claude Code, Codex CLI, and any MCP-capable agent connect through the bundled stdio MCP server. [Hermes Agent](https://github.com/NousResearch/hermes-agent) gets a deeper native integration as a drop-in memory provider. Point them all at the same database and they share one brain: a fact learned in one agent's session is recalled in every other agent's next one.
+Enfold is a local SQLite memory layer for AI agents. It gives MCP-capable agents and Hermes Agent a shared fact store with temporal supersession, write-time dedup gates, hybrid holographic plus dense retrieval, and a reproducible eval harness.
 
-The name is the design. In a hologram, every fragment of the plate reconstructs the whole scene. Enfold treats memory the same way: facts are stored once, atomically, and a partial cue (a paraphrase, an entity, a stray keyword) is enough to bring back full context.
+It is for people building agents that run across sessions, terminals, and tools, where stale facts and duplicate memories are bugs. Try it in 60 seconds with the MCP server below; no hosted service or container is required.
 
-## Why Enfold
+The name is the design. In a hologram, every fragment of the plate reconstructs the whole scene. Enfold treats memory the same way: facts are stored once, atomically, and a partial cue (a paraphrase, an entity, a stray keyword) can bring back full context.
+
+## 60-second Quickstart
+
+```bash
+git clone https://github.com/victorv2i/enfold.git
+cd enfold
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e ".[mcp,fastembed]"
+python enfold/mcp_server.py \
+    --db-path /tmp/enfold-memory.db \
+    --embedding-backend fastembed \
+    --hrr-dim 256
+```
+
+That last command is the stdio MCP server. In a real client config, use the same file-path launch and arguments:
+
+```toml
+[mcp_servers.enfold]
+command = "/absolute/path/to/enfold/.venv/bin/python"
+args = ["/absolute/path/to/enfold/enfold/mcp_server.py",
+        "--db-path", "/home/you/enfold-memory.db",
+        "--embedding-backend", "fastembed",
+        "--hrr-dim", "256"]
+```
+
+Verified smoke behavior in this review: `python3 enfold/mcp_server.py --db-path /tmp/enfold-review-host.db --embedding-backend fastembed --hrr-dim 256` reached the stdio server loop with no startup error. In this sandbox, public `git clone` and `pip install` could not be fully verified because DNS/PyPI access was unavailable.
+
+Two launch details matter:
+
+- Run the server by file path, not `python -m enfold.mcp_server` (details in [MCP server](#mcp-server)).
+- For a new standalone MCP store, `--hrr-dim 256` is the documented quickstart geometry. When sharing a store with a live Hermes gateway, use the gateway's configured `hrr_dim` instead.
+
+## Feature Map
 
 - **Recall by meaning, not keywords.** Dense embeddings, BM25 keyword search, token overlap, and holographic (HRR) compositional retrieval are blended into one trust-weighted score. Paraphrases hit; so do exact ports, SHAs, and hostnames.
-- **One brain, many agents.** The MCP server and the Hermes gateway operate on the same SQLite file concurrently, with WAL plus a cross-process write lock. Every write carries a `source` tag, so you always know which agent learned what.
+- **One store, many agents.** The MCP server and the Hermes gateway operate on the same SQLite file concurrently, with WAL plus a cross-process write lock. Every write carries a `source` tag, so you always know which agent learned what.
 - **Writes are gated, so the store stays clean.** Near-duplicate restatements are rejected at write time. A genuine value update (same fact, new number or state) supersedes the old fact instead of coexisting with it, and the history chain is preserved: invalidate, never delete.
 - **Local-first, nothing leaves your machine.** SQLite for storage, local embeddings via Ollama (GPU) or FastEmbed (CPU-only, zero infrastructure). If the embedder is down, recall degrades gracefully to keyword and symbolic search instead of failing.
-- **Measured, not vibes.** Ships a reproducible recall benchmark; every number in this README comes from a script in the repo. When a fashionable technique lost (a cross-encoder reranker, for one), it was dropped and the negative result documented.
+- **Benchmarked behavior.** Ships a reproducible recall benchmark; every number in this README comes from a script in the repo. When a cross-encoder reranker regressed recall on this workload, it was dropped and the negative result documented.
 - **Built for unattended operation.** Fact extraction runs through a crash-safe SQLite queue with retries, backoff, and dead-letter rows. Sleep-time reflection distills grounded insights from clusters of related facts, with mandatory citations back to sources.
+- **Self-tuning loop.** `memory_eval/autotune.py` copies the live SQLite DB, runs bounded retrieval trials on snapshots, rejects configs that leak stale facts, and writes a proposal report without mutating the live config.
+
+## Numbers
+
+Reports land under `$HERMES_HOME/reports/memory-eval/` (one JSON plus a short summary per run).
+
+Environment notes: single-user local SQLite store; Python provider path; 50 exact-fact smoke cases; live DB copied with the SQLite backup API before provider load. The first run had the Ollama backend unavailable and fell back to holographic-only retrieval. A same-day rerun used Ollama with `embeddinggemma` confirmed in metadata. This is a smoke test for current-fact recall and stale suppression, not a hard semantic benchmark.
+
+| Run | Recall@1 | MRR | Stale leak@1 | Stale leak@3 | Latency |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Holographic fallback | 1.0000 | 1.0000 | 0/50 | 0/50 | mean 3.885 ms, p95 6.819 ms |
+| Dense path, Ollama `embeddinggemma` | 1.0000 | 1.0000 | 0/50 | 0/50 | mean 81.4 ms, p95 92.5 ms |
+
+What this says honestly: the exact-fact smoke set passed, temporal stale suppression held, and dense retrieval added about 77 ms mean latency without changing outcomes on this easy set. The next eval investment is a semantic case set with paraphrases and distractors.
 
 ## Quickstart: Claude Code
 
 ```bash
 git clone https://github.com/victorv2i/enfold.git
-pip install mcp numpy fastembed
+cd enfold
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e ".[mcp,fastembed]"
 
-claude mcp add enfold -- python3 /absolute/path/to/enfold/enfold/mcp_server.py \
+claude mcp add enfold -- /absolute/path/to/enfold/.venv/bin/python /absolute/path/to/enfold/enfold/mcp_server.py \
     --db-path ~/enfold-memory.db \
-    --embedding-backend fastembed
+    --embedding-backend fastembed \
+    --hrr-dim 256
 ```
 
 That's the whole setup. Your agent now has `memory_search`, `memory_add`, `memory_supersede`, `memory_explain`, and `memory_history`. No server to babysit, no container, no cloud.
@@ -42,6 +94,7 @@ That's the whole setup. Your agent now has `memory_search`, `memory_add`, `memor
 Two things to know:
 
 - Run the server **by file path**, never `python -m` (details in [MCP server](#mcp-server)).
+- For a new standalone MCP store, pass `--hrr-dim 256`. For a shared Hermes store, pass the gateway's configured `hrr_dim`.
 - FastEmbed downloads its model on first run; without an embedding backend, the server still works with keyword and symbolic recall only.
 - Without a Hermes checkout, the server runs on a bundled lightweight engine (real SQLite, FTS5, trust scores, and entity links; the same harness the 300-test suite runs against). For the full holographic engine, add `--hermes-src /path/to/hermes-agent/src`. A plain `git clone` of hermes-agent is enough: no install, no running gateway.
 
@@ -51,10 +104,11 @@ In `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.enfold]
-command = "python3"
+command = "/absolute/path/to/enfold/.venv/bin/python"
 args = ["/absolute/path/to/enfold/enfold/mcp_server.py",
         "--db-path", "/home/you/enfold-memory.db",
-        "--embedding-backend", "fastembed"]
+        "--embedding-backend", "fastembed",
+        "--hrr-dim", "256"]
 ```
 
 Any other MCP-capable agent wires up the same way: it is a plain stdio MCP server.
@@ -96,7 +150,7 @@ Enfold does not replace the bundled Hermes holographic provider, it subclasses i
 
 ## Benchmarks
 
-A reproducible recall benchmark (`tests/eval.py` for the dense layer, plus an end-to-end provider sweep over a 120-fact / 72-query set with hard distractor clusters) gives a clear picture for a single-user self-hosted store. End-to-end recall@1 / MRR through the real provider:
+A reproducible recall benchmark (`tests/eval.py` for the dense layer, plus the `memory_eval/` end-to-end harness for provider sweeps on SQLite snapshots) measures single-user self-hosted stores. One earlier 120-fact / 72-query sweep with hard distractor clusters produced:
 
 ```
 bge-large, no prefix, HRR on (typical default)    r@1 0.69   MRR 0.79
@@ -124,6 +178,18 @@ plugins:
 CPU-only alternative: `embedding_backend: fastembed`, `fastembed_model: snowflake/snowflake-arctic-embed-l`, `embedding_prefix_policy: auto`.
 
 These numbers are from one synthetic set, so treat small gaps as noise and re-run `tests/eval.py` on your own data before committing to a change.
+
+The autotune loop uses the same harness:
+
+```bash
+python -m memory_eval.autotune \
+    --max-experiments 200 \
+    --max-minutes 480 \
+    --db ~/.hermes/memory_store.db \
+    --repo-root /absolute/path/to/enfold
+```
+
+It writes `experiments.jsonl`, `summary.json`, and `RECOMMENDATION.md` under `~/.hermes/reports/memory-eval/autotune-*`. It is proposal-only: each trial runs on a fresh SQLite backup, and the live DB/config are not changed.
 
 ## Configuration
 
@@ -179,12 +245,13 @@ Run the server **by file path**, not with `-m`:
 python3 enfold/mcp_server.py \
     --db-path ~/.hermes/memory_store.db \
     --ollama-url http://localhost:11434 \
-    --ollama-model embeddinggemma:latest
+    --ollama-model embeddinggemma:latest \
+    --hrr-dim 256
 ```
 
 `python -m enfold.mcp_server` (or anything that imports `enfold` as a package before this module resolves its own parent Hermes checkout) triggers `enfold/__init__.py`'s unconditional `plugins.memory.holographic` import at module load time. On a host with a second, unrelated Hermes install already on `sys.path`, that import can win silently and this module never gets to point at the checkout you actually meant (`ENFOLD_HERMES_SRC`, see `mcp_provider.py`). Running the file directly sidesteps `__init__.py` entirely, which is why every example here uses the file path.
 
-When sharing a store with a live Hermes gateway, `--hrr-dim` must match the `hrr_dim` the gateway is configured with. There is no auto-detection: a mismatched dimension does not error at startup, it crashes later, the first time HRR scoring runs against a vector encoded at the other dimension.
+When sharing a store with a live Hermes gateway, `--hrr-dim` must match the `hrr_dim` the gateway is configured with. The standalone quickstart uses `--hrr-dim 256`; do not reuse that value for a shared gateway store unless the gateway also uses 256. There is no auto-detection: a mismatched dimension does not error at startup, it crashes later, the first time HRR scoring runs against a vector encoded at the other dimension.
 
 Every write must carry a `source` tag, one of `claude-code`, `codex`, or `other`; `memory_add` and `memory_supersede` reject a call without one. The tag is appended to the fact's `tags` as `source:<agent>`, so it's visible alongside the fact everywhere tags already show up. Writes from the MCP server go through the exact same dedup and value-update-supersession gates as a live Hermes write: a near-duplicate is rejected and the existing fact's id returned instead of storing again, and a genuine value update (same wording, a changed number/id/state word) supersedes the prior fact automatically.
 
@@ -225,7 +292,7 @@ embedding         0.81      0.88      0.88    0.86
 blend*            0.81      0.88      0.88    0.86
 ```
 
-The dense-embedding layer roughly doubles recall@1 over keyword (0.38 → 0.81) on paraphrased queries, the exact case where keyword search fails. `*` The `blend` row is an *illustrative* keyword+embedding mix for this isolated comparison; it is **not** the formula the plugin ships. The real scorer adds the trust-weighted embedding onto the trust-weighted holographic score across FTS+Jaccard+HRR (see `_blend_score`). The keyword and HRR signals earn their weight on literal and compositional queries, which this benchmark intentionally underweights. It is a synthetic, illustrative benchmark, not a production guarantee, but every number is reproducible from the script.
+The dense-embedding layer roughly doubles recall@1 over keyword (0.38 to 0.81) on paraphrased queries, the exact case where keyword search fails. `*` The `blend` row is an *illustrative* keyword+embedding mix for this isolated comparison; it is **not** the formula the plugin ships. The real scorer adds the trust-weighted embedding onto the trust-weighted holographic score across FTS+Jaccard+HRR (see `_blend_score`). The keyword and HRR signals earn their weight on literal and compositional queries, which this benchmark intentionally underweights. It is a synthetic, illustrative benchmark, not a production guarantee, but every number is reproducible from the script.
 
 There is also a larger harness under `memory_eval/` for end-to-end sweeps against a real database snapshot.
 

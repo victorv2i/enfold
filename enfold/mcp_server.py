@@ -376,12 +376,12 @@ def build_server(provider, read_only: bool = False) -> "FastMCP":
             return {"error": "invalid old_fact_id: must be a positive integer"}
         if safe_old_fact_id <= 0:
             return {"error": "invalid old_fact_id: must be a positive integer"}
-        if not _active_fact_exists(provider, safe_old_fact_id):
-            return {"error": "invalid old_fact_id: active fact not found"}
 
         tagged = _tag_source(tags, source)
 
         def _do_supersede() -> Dict[str, Any]:
+            if not _active_fact_exists(provider, safe_old_fact_id):
+                return {"error": "invalid old_fact_id: active fact not found"}
             new_fact_id = provider._store.add_fact(new_content, category=category, tags=tagged)
             provider._embed_cb(new_fact_id, new_content)
             if not _supersede_with_rowcount(provider, safe_old_fact_id, int(new_fact_id)):

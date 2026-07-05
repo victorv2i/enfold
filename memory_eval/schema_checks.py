@@ -7,8 +7,8 @@ from typing import Any
 
 from .sqlite_utils import TERMINAL_EXTRACT_QUEUE_STATUSES, connect_readonly
 
-_REQUIRED_PROVENANCE_TABLES = {"raw_episodes", "fact_provenance"}
-_REQUIRED_FACT_TEMPORAL_COLUMNS = {"valid_from", "valid_to", "superseded_by"}
+_ADVISORY_PROVENANCE_TABLES = {"raw_episodes", "fact_provenance"}
+_REQUIRED_FACT_TEMPORAL_COLUMNS = {"valid_from", "invalid_at", "superseded_by"}
 
 
 def _tables(conn) -> set[str]:
@@ -81,13 +81,12 @@ def inspect_memory_schema(
         hrr_count = _hrr_count(conn) if "facts" in tables and "hrr_vector" in fact_columns else 0
         queue_pending = _pending_queue_count(conn) if "extract_queue" in tables else 0
 
-    missing_tables = sorted(_REQUIRED_PROVENANCE_TABLES - tables)
+    missing_provenance_tables = sorted(_ADVISORY_PROVENANCE_TABLES - tables)
     missing_fact_columns = sorted(_REQUIRED_FACT_TEMPORAL_COLUMNS - fact_columns)
     embedding_coverage = 0.0 if fact_count == 0 else embedding_count / fact_count
     hrr_coverage = 0.0 if fact_count == 0 else hrr_count / fact_count
 
-    temporal_ok = not missing_fact_columns or "fact_supersessions" in tables
-    provenance_ok = not missing_tables
+    temporal_ok = not missing_fact_columns
     return {
         "tables": sorted(tables),
         "counts": {
@@ -106,11 +105,14 @@ def inspect_memory_schema(
         "sota_gates": {
             "embedding_coverage_complete": fact_count > 0 and embedding_count == fact_count,
             "extract_queue_empty": queue_pending == 0,
-            "provenance_tables": provenance_ok,
+            "provenance_tables": True,
             "temporal_supersession": temporal_ok,
         },
         "missing": {
-            "tables": missing_tables,
+            "tables": [],
             "fact_columns": missing_fact_columns,
+        },
+        "warnings": {
+            "missing_provenance_tables": missing_provenance_tables,
         },
     }

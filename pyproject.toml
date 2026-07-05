@@ -17,4 +17,7 @@ fastembed = ["fastembed"]
 test = ["pytest"]
 
 [tool.setuptools]
-packages = ["enfold"]
+packages = ["enfold", "memory_eval"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

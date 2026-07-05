@@ -383,6 +383,34 @@ def test_memory_supersede_rejects_unknown_old_fact_before_insert(mcp_server_mod,
     assert count == 0
 
 
+def test_memory_supersede_rechecks_active_old_fact_inside_write_lock(
+    mcp_server_mod, provider, monkeypatch
+):
+    first_id = provider._store.add_fact(
+        "Alex Rivera's Springfield office is on the third floor",
+        category="general",
+    )
+
+    def stale_during_locked_body(_provider, _fact_id):
+        return False
+
+    monkeypatch.setattr(mcp_server_mod, "_active_fact_exists", stale_during_locked_body)
+    server = mcp_server_mod.build_server(provider, read_only=False)
+    result = _content_json(_call(server, "memory_supersede", {
+        "old_fact_id": first_id,
+        "new_content": "Alex Rivera's Springfield office is on the ninth floor",
+        "source": "other",
+    }))
+
+    assert result["error"] == "invalid old_fact_id: active fact not found"
+    rows = provider._store._conn.execute(
+        "SELECT content FROM facts ORDER BY fact_id"
+    ).fetchall()
+    assert [row["content"] for row in rows] == [
+        "Alex Rivera's Springfield office is on the third floor"
+    ]
+
+
 def test_memory_supersede_rejects_non_positive_old_fact_id(mcp_server_mod, provider):
     server = mcp_server_mod.build_server(provider, read_only=False)
     result = _content_json(_call(server, "memory_supersede", {

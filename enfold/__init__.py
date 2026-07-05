@@ -121,10 +121,15 @@ _STATE_WORD_GROUPS = (
     frozenset(("started", "stopped")),
 )
 _STATE_WORDS = frozenset().union(*_STATE_WORD_GROUPS)
+_NEGATION_WORDS = frozenset(("not", "no", "never", "without"))
 
 
 def _state_words(text: str) -> set:
     return _content_tokens(text) & _STATE_WORDS
+
+
+def _negation_words(text: str) -> set:
+    return _norm_tokens(text) & _NEGATION_WORDS
 
 
 def _subjectish_tokens(text: str) -> set:
@@ -159,6 +164,15 @@ def _has_opposing_state_words(
     return False
 
 
+def _has_negation_mismatch(
+    content: str, other: str, *, require_context: bool = True
+) -> bool:
+    """True when one side contains explicit negation and the other does not."""
+    if require_context and not _has_subjectish_overlap(content, other):
+        return False
+    return bool(_negation_words(content)) != bool(_negation_words(other))
+
+
 def _is_near_duplicate(content: str, other: str, threshold: float) -> bool:
     """True only if *content* is a near-identical RESTATEMENT of *other*: the same
     concrete values AND the same content words (ignoring function words and word
@@ -170,6 +184,8 @@ def _is_near_duplicate(content: str, other: str, threshold: float) -> bool:
     are left to the value-aware, reviewable consolidation pass, not dropped here.
     """
     if _value_tokens(content) != _value_tokens(other):
+        return False
+    if _has_negation_mismatch(content, other):
         return False
     if _jaccard(_norm_tokens(content), _norm_tokens(other)) < threshold:
         return False
@@ -201,6 +217,8 @@ def _is_semantic_duplicate(
     if _value_tokens(content) != _value_tokens(other):
         return False
     if _has_opposing_state_words(content, other, require_context=False):
+        return False
+    if _has_negation_mismatch(content, other, require_context=False):
         return False
     if _content_tokens(content) != _content_tokens(other):
         if _jaccard(_norm_tokens(content), _norm_tokens(other)) >= _RESTATEMENT_JACCARD:

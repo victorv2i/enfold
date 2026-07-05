@@ -30,11 +30,101 @@ from __future__ import annotations
 
 import sqlite3
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
-# Reuse the same content-token / value-token split as the near-duplicate gate
-# so a value-update decision is consistent with the dedup gate it complements.
-from . import _content_tokens, _has_opposing_state_words, _state_words, _value_tokens
+# Keep this module importable before package __init__ has finished executing.
+# Hermes' user-plugin loader preloads sibling .py files, so importing token
+# helpers from "." here can leave a half-initialized temporal module in
+# sys.modules and break the later package import. These helpers intentionally
+# mirror the near-duplicate gate's token/state split in __init__.py.
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_STOPWORDS = frozenset(
+    "a an the is are was were be been being am of to in on at for and or with by "
+    "as it its this that these those from into over under has have had do does did "
+    "will would can could should may might must not no".split()
+)
+_STATE_WORD_GROUPS = (
+    frozenset(("enabled", "disabled")),
+    frozenset(("active", "inactive", "archived")),
+    frozenset(("on", "off")),
+    frozenset(("open", "closed")),
+    frozenset(("paused", "resumed")),
+    frozenset(("up", "down")),
+    frozenset(("alive", "dead")),
+    frozenset(("started", "stopped")),
+)
+_STATE_WORDS = frozenset().union(*_STATE_WORD_GROUPS)
+_NEGATION_WORDS = frozenset(("not", "no", "never", "without"))
+
+
+def _norm_token_sequence(text: str) -> tuple:
+    """Lowercased alphanumeric tokens in text order."""
+    return tuple(_WORD_RE.findall((text or "").lower()))
+
+
+def _norm_tokens(text: str) -> set:
+    """Lowercased alphanumeric token set."""
+    return set(_norm_token_sequence(text))
+
+
+def _value_tokens(text: str) -> tuple:
+    """Tokens carrying a concrete value (numbers, ports, SHAs, ids, versions)."""
+    return tuple(t for t in _norm_token_sequence(text) if any(c.isdigit() for c in t))
+
+
+def _content_tokens(text: str) -> set:
+    """Significant (non-function) words."""
+    return _norm_tokens(text) - _STOPWORDS
+
+
+def _state_words(text: str) -> set:
+    return _content_tokens(text) & _STATE_WORDS
+
+
+def _negation_words(text: str) -> set:
+    return _norm_tokens(text) & _NEGATION_WORDS
+
+
+def _subjectish_tokens(text: str) -> set:
+    tokens = _content_tokens(text) - _STATE_WORDS
+    expanded = set(tokens)
+    for token in tokens:
+        for suffix in ("ation", "ing", "ed", "ic", "ion", "s"):
+            if token.endswith(suffix) and len(token) > len(suffix) + 2:
+                expanded.add(token[: -len(suffix)])
+    return expanded
+
+
+def _has_subjectish_overlap(content: str, other: str) -> bool:
+    return bool(_subjectish_tokens(content) & _subjectish_tokens(other))
+
+
+def _has_opposing_state_words(
+    content: str, other: str, *, require_context: bool = True
+) -> bool:
+    """True when opposite state words appear on opposite sides."""
+    if require_context and not _has_subjectish_overlap(content, other):
+        return False
+    a_states = _state_words(content)
+    b_states = _state_words(other)
+    if not a_states or not b_states:
+        return False
+    for group in _STATE_WORD_GROUPS:
+        a_group = a_states & group
+        b_group = b_states & group
+        if a_group and b_group and a_group != b_group:
+            return True
+    return False
+
+
+def _has_negation_mismatch(
+    content: str, other: str, *, require_context: bool = True
+) -> bool:
+    """True when one side contains explicit negation and the other does not."""
+    if require_context and not _has_subjectish_overlap(content, other):
+        return False
+    return bool(_negation_words(content)) != bool(_negation_words(other))
 
 logger = logging.getLogger(__name__)
 
@@ -88,11 +178,15 @@ def _is_value_update(content: str, other: str) -> bool:
     """
     a_values, b_values = _value_tokens(content), _value_tokens(other)
     if a_values == b_values:
-        return _has_opposing_state_words(content, other)
+        return _has_opposing_state_words(content, other) or _has_negation_mismatch(
+            content, other
+        )
     a_value_set = set(a_values)
     b_value_set = set(b_values)
     if not a_value_set or not b_value_set:
-        return _has_opposing_state_words(content, other)
+        return _has_opposing_state_words(content, other) or _has_negation_mismatch(
+            content, other
+        )
     # Compare content words with the differing value tokens and state words
     # removed, so "port 3100" -> "port 3200" is judged on {"port"}.
     a_words = _content_tokens(content) - a_value_set - _state_words(content)

@@ -10,10 +10,13 @@ string-prefix filter still works alongside structural supersession.
 """
 
 import contextlib
+import importlib.util
 import logging
 from pathlib import Path
 import sqlite3
+import sys
 import threading
+import types
 
 import pytest
 
@@ -171,10 +174,39 @@ def test_low_jaccard_state_change_is_a_value_update():
     assert _is_value_update(b, a) is True
 
 
+def test_negation_change_is_a_value_update():
+    a = "The Skylark sandbox service is currently configured to run nightly for the gateway."
+    b = "The Skylark sandbox service is not currently configured to run nightly for the gateway."
+    assert _is_value_update(b, a) is True
+
+
 def test_unrelated_fact_is_not_a_value_update():
     a = "The Skylark dashboard port is 3100."
     b = "Alex Rivera moved to Springfield last month."
     assert _is_value_update(b, a) is False
+
+
+def test_temporal_module_imports_before_package_helpers_are_initialized(monkeypatch):
+    """Hermes may preload temporal.py while the parent package is half-built."""
+    repo_root = Path(__file__).resolve().parents[1]
+    pkg = types.ModuleType("enfold")
+    pkg.__path__ = [str(repo_root / "enfold")]
+    monkeypatch.setitem(sys.modules, "enfold", pkg)
+    sys.modules.pop("enfold.temporal", None)
+
+    spec = importlib.util.spec_from_file_location(
+        "enfold.temporal",
+        repo_root / "enfold" / "temporal.py",
+        submodule_search_locations=None,
+    )
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "enfold.temporal", module)
+    spec.loader.exec_module(module)
+
+    assert module._is_value_update(
+        "Automatic restarts are disabled now for Springfield.",
+        "The Springfield timer is enabled for restart automation.",
+    ) is True
 
 
 def test_find_value_update_target_skips_already_superseded_candidate():

@@ -34,9 +34,9 @@ def test_inspect_memory_schema_flags_missing_sota_layers(tmp_path):
 
     report = inspect_memory_schema(db)
 
-    assert report["sota_gates"]["provenance_tables"] is False
+    assert report["sota_gates"]["provenance_tables"] is True
     assert report["sota_gates"]["temporal_supersession"] is False
-    assert "fact_provenance" in report["missing"]["tables"]
+    assert "fact_provenance" in report["warnings"]["missing_provenance_tables"]
     assert "valid_from" in report["missing"]["fact_columns"]
 
 

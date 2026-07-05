@@ -39,6 +39,13 @@ def test_antonym_flip_is_kept():
     assert _is_near_duplicate(c, d, 0.9) is False
 
 
+def test_negation_flip_is_kept():
+    a = "The Skylark sandbox service is currently configured to run nightly for the gateway"
+    b = "The Skylark sandbox service is not currently configured to run nightly for the gateway"
+    assert _is_near_duplicate(a, b, 0.9) is False
+    assert _is_semantic_duplicate(a, b, 0.99, 0.92) is False
+
+
 def test_changed_number_is_kept():
     assert _is_near_duplicate("LDI Canvas port is 3100", "LDI Canvas port is 3200", 0.5) is False
 
