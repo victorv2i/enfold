@@ -11,10 +11,13 @@ from __future__ import annotations
 import importlib.util
 import os
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from enfold.schema import migrate
 
 # mcp_provider.py decides which parent hermes modules to load (real checkout
 # vs fake_hermes stubs) BEFORE enfold itself is ever imported. A
@@ -40,6 +43,14 @@ def _load_mcp_provider():
 
 
 mcp_provider = _load_mcp_provider()
+
+
+def _migrate_path_to_v1(db_path: Path) -> None:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        migrate(conn)
+    finally:
+        conn.close()
 
 
 def test_resolve_parent_modules_falls_back_to_fake_hermes(monkeypatch):
@@ -209,6 +220,89 @@ def test_build_provider_uses_configurable_db_path(tmp_path, monkeypatch):
         provider.shutdown()
 
 
+def test_writable_legacy_mcp_refuses_v1_without_migrating(tmp_path, monkeypatch):
+    monkeypatch.delenv("ENFOLD_HERMES_SRC", raising=False)
+    db_path = tmp_path / "v1.db"
+    _migrate_path_to_v1(db_path)
+
+    with pytest.raises(
+        mcp_provider.LegacySchemaCompatibilityError,
+        match="v1 reads and writes require the scoped standalone Enfold service",
+    ):
+        mcp_provider.build_provider(
+            db_path=str(db_path), embedding_backend="fake", hrr_dim=64
+        )
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_read_only_legacy_mcp_refuses_scope_aware_v1(tmp_path, monkeypatch):
+    monkeypatch.delenv("ENFOLD_HERMES_SRC", raising=False)
+    db_path = tmp_path / "v1-reader.db"
+    _migrate_path_to_v1(db_path)
+
+    with pytest.raises(
+        mcp_provider.LegacySchemaCompatibilityError,
+        match="scope- and conflict-unaware.*No migration was attempted",
+    ):
+        mcp_provider.build_provider(
+            db_path=str(db_path),
+            embedding_backend="fake",
+            hrr_dim=64,
+            read_only=True,
+        )
+
+
+def test_legacy_mcp_rejects_incomplete_version_ledger(tmp_path):
+    db_path = tmp_path / "broken-ledger.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(
+        mcp_provider.LegacySchemaCompatibilityError, match="incomplete Enfold schema ledger"
+    ):
+        mcp_provider.build_provider(
+            db_path=str(db_path), embedding_backend="fake", hrr_dim=64
+        )
+
+
+def test_read_only_legacy_mcp_rejects_partial_v1_shape(tmp_path):
+    db_path = tmp_path / "partial-v1.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE schema_migrations(
+            version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
+        );
+        CREATE TABLE enfold_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO schema_migrations VALUES (1, 'now');
+        INSERT INTO enfold_meta VALUES ('schema_version', '1');
+        """
+    )
+    conn.close()
+
+    with pytest.raises(
+        mcp_provider.LegacySchemaCompatibilityError,
+        match="scope- and conflict-unaware.*No migration was attempted",
+    ):
+        mcp_provider.build_provider(
+            db_path=str(db_path),
+            embedding_backend="fake",
+            hrr_dim=64,
+            read_only=True,
+        )
+
+
 def test_build_provider_defaults_match_live_ollama_identity(tmp_path, monkeypatch):
     """Defaults mirror the live box: ollama backend, embeddinggemma model, auto prefix."""
     monkeypatch.delenv("ENFOLD_HERMES_SRC", raising=False)
@@ -283,9 +377,34 @@ _REAL_HERMES_SRC = os.environ.get(
 _REAL_HOLO_DIR = Path(_REAL_HERMES_SRC) / "plugins" / "memory" / "holographic"
 
 
+def _real_hermes_source_is_usable() -> bool:
+    """Whether the staging checkout can load through Enfold's real bridge."""
+
+    if not (_REAL_HOLO_DIR / "store.py").exists():
+        return False
+    code = (
+        "import importlib.util\n"
+        f"spec = importlib.util.spec_from_file_location('mcpp', {str(_MCP_PROVIDER_PATH)!r})\n"
+        "mcpp = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mcpp)\n"
+        f"mcpp.resolve_parent_modules({str(_REAL_HERMES_SRC)!r})\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    return result.returncode == 0
+
+
 @pytest.mark.skipif(
-    not (_REAL_HOLO_DIR / "store.py").exists(),
-    reason=f"real hermes checkout not found at {_REAL_HERMES_SRC}",
+    not _real_hermes_source_is_usable(),
+    reason=(
+        "real Hermes staging source is unavailable or cannot import through "
+        "the Enfold bridge"
+    ),
 )
 def test_resolve_parent_modules_real_checkout_resolves_to_real(monkeypatch):
     """When a real checkout is configured and present, it wins over the fallback.

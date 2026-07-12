@@ -1,0 +1,9 @@
+name: enfold_v1
+version: 0.7.0
+description: "Optional Hermes bridge to the standalone, scoped Enfold v1 daemon."
+provides_hooks:
+  - on_session_end
+  - on_pre_compress
+  - on_memory_write
+  - on_delegation
+  - on_session_switch

@@ -20,6 +20,7 @@ are needed.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import random
 import re
@@ -103,7 +104,8 @@ CREATE TABLE IF NOT EXISTS extract_queue (
     status     TEXT NOT NULL DEFAULT 'pending',
     not_before REAL,
     lease_owner TEXT,
-    lease_until REAL
+    lease_until REAL,
+    payload_hash TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_extract_queue_status
@@ -141,6 +143,7 @@ class ExtractQueue:
             ("not_before", "REAL"),
             ("lease_owner", "TEXT"),
             ("lease_until", "REAL"),
+            ("payload_hash", "TEXT"),
         ):
             if name in cols:
                 continue
@@ -152,6 +155,42 @@ class ExtractQueue:
                 # loser's ALTER TABLE is a no-op, not a real failure.
                 if "duplicate column name" not in str(exc).lower():
                     raise
+
+        # The hash is queue idempotency metadata, not a change to the parent
+        # fact schema.  A partial unique index prevents overlapping pending or
+        # processing copies while allowing a completed/dead payload to be
+        # deliberately queued again later.  Legacy active duplicates are
+        # preserved: the oldest gets the hash and later copies remain NULL.
+        has_index = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='uq_extract_queue_active_payload_hash'"
+        ).fetchone()
+        if has_index is None:
+            rows = self._conn.execute(
+                "SELECT id, payload, status FROM extract_queue ORDER BY id"
+            ).fetchall()
+            active_hashes: set[str] = set()
+            for row_id, payload, status in rows:
+                digest = self._payload_hash(str(payload))
+                if status in (STATUS_PENDING, STATUS_PROCESSING):
+                    if digest in active_hashes:
+                        continue
+                    active_hashes.add(digest)
+                self._conn.execute(
+                    "UPDATE extract_queue SET payload_hash = ? WHERE id = ?",
+                    (digest, int(row_id)),
+                )
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "uq_extract_queue_active_payload_hash "
+                "ON extract_queue(payload_hash) "
+                "WHERE payload_hash IS NOT NULL "
+                "AND status IN ('pending', 'processing')"
+            )
+
+    @staticmethod
+    def _payload_hash(payload: str) -> str:
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _age_exceeded(created_epoch) -> bool:
@@ -173,10 +212,35 @@ class ExtractQueue:
         encoded = payload.encode("utf-8")
         if len(encoded) > MAX_PAYLOAD_BYTES:
             payload = encoded[-MAX_PAYLOAD_BYTES:].decode("utf-8", errors="ignore")
+        payload_hash = self._payload_hash(payload)
         with self._lock:
+            existing = self._conn.execute(
+                "SELECT id FROM extract_queue "
+                "WHERE status IN (?, ?) "
+                "AND (payload_hash = ? OR (payload_hash IS NULL AND payload = ?)) "
+                "ORDER BY id LIMIT 1",
+                (STATUS_PENDING, STATUS_PROCESSING, payload_hash, payload),
+            ).fetchone()
+            if existing is not None:
+                return int(existing[0])
             cur = self._conn.execute(
-                "INSERT INTO extract_queue (payload) VALUES (?)", (payload,)
+                "INSERT OR IGNORE INTO extract_queue (payload, payload_hash) "
+                "VALUES (?, ?)",
+                (payload, payload_hash),
             )
+            if int(cur.rowcount) == 0:
+                row = self._conn.execute(
+                    "SELECT id FROM extract_queue WHERE payload_hash = ? "
+                    "AND status IN (?, ?) ORDER BY id LIMIT 1",
+                    (payload_hash, STATUS_PENDING, STATUS_PROCESSING),
+                ).fetchone()
+                if row is None:  # pragma: no cover - defensive constraint guard
+                    self._conn.rollback()
+                    raise sqlite3.IntegrityError(
+                        "extract queue idempotency conflict had no active row"
+                    )
+                self._conn.commit()
+                return int(row[0])
             self._conn.commit()
             return int(cur.lastrowid)
 
@@ -318,13 +382,34 @@ class ExtractQueue:
         Returns the number of rows revived.
         """
         sql = """
-            UPDATE extract_queue
+            UPDATE extract_queue AS candidate
             SET status = ?, attempts = 0, not_before = NULL,
                 lease_owner = NULL, lease_until = NULL,
                 last_error = COALESCE(last_error, '') || ' (revived)'
             WHERE status = ?
+              AND (
+                    payload_hash IS NULL
+                    OR (
+                        candidate.id = (
+                            SELECT MIN(peer.id) FROM extract_queue AS peer
+                            WHERE peer.status = ?
+                              AND peer.payload_hash = candidate.payload_hash
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM extract_queue AS active
+                            WHERE active.payload_hash = candidate.payload_hash
+                              AND active.status IN (?, ?)
+                        )
+                    )
+                  )
         """
-        params: list = [STATUS_PENDING, STATUS_DEAD]
+        params: list = [
+            STATUS_PENDING,
+            STATUS_DEAD,
+            STATUS_DEAD,
+            STATUS_PENDING,
+            STATUS_PROCESSING,
+        ]
         if ids is not None:
             id_list = [int(i) for i in ids]
             if not id_list:

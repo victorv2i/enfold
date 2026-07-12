@@ -23,8 +23,6 @@ import re
 import sqlite3
 import sys
 
-import numpy as np
-
 # Make the package importable without a full Hermes install: reuse the test
 # suite's hermes stubs (same mechanism as tests/conftest.py).
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))

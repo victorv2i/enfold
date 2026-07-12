@@ -34,17 +34,172 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
+
 from .embed_store import EmbedStore
+from .sqlite_vec_index import SQLiteVecIndex
 
 _SUPERSEDED_PREFIXES = ("superseded", "stale/disabled", "historical/superseded")
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_NEGATION_WORDS = frozenset(("not", "no", "never", "without"))
+_DATE_WORDS = frozenset(
+    "january february march april may june july august september october november december "
+    "monday tuesday wednesday thursday friday saturday sunday today tomorrow yesterday"
+    .split()
+)
+_STATE_WORD_GROUPS = (
+    frozenset(("enabled", "disabled")),
+    frozenset(("active", "inactive", "archived")),
+    frozenset(("on", "off")),
+    frozenset(("open", "closed")),
+    frozenset(("paused", "resumed")),
+    frozenset(("up", "down")),
+    frozenset(("alive", "dead")),
+    frozenset(("started", "stopped")),
+    frozenset(("pending", "running", "completed", "failed", "succeeded")),
+    frozenset(("deployed", "undeployed", "installed", "uninstalled")),
+    frozenset(("available", "unavailable")),
+    frozenset(("approved", "rejected", "accepted", "denied")),
+)
+_STATE_WORDS = frozenset().union(*_STATE_WORD_GROUPS)
 
 
 class GuardRailError(Exception):
     """Raised when execute_merge refuses to run for safety reasons."""
+
+
+@dataclass(frozen=True, slots=True)
+class NearDuplicateCandidate:
+    """An active FTS-prefiltered fact whose stored vector matches a write."""
+
+    fact_id: int
+    trust_score: float
+    created_at: str
+    cosine: float
+
+
+def _tokens(content: str) -> tuple[str, ...]:
+    return tuple(_TOKEN_RE.findall((content or "").lower()))
+
+
+def _value_tokens(content: str) -> tuple[str, ...]:
+    """Concrete values, including dates, versions, ids, and plain numbers."""
+    return tuple(
+        token for token in _tokens(content)
+        if any(char.isdigit() for char in token) or token in _DATE_WORDS
+    )
+
+
+def _state_tokens(content: str) -> frozenset[str]:
+    tokens = _tokens(content)
+    states = set(tokens) & _STATE_WORDS
+    # ``on`` is commonly a preposition ("listens on port 3100"), whereas
+    # ``is on`` and ``turned on`` are lifecycle assertions.  Do not let the
+    # preposition turn an otherwise safe paraphrase into a false state change.
+    for index, token in enumerate(tokens):
+        if token in {"on", "off"} and (
+            index == 0 or tokens[index - 1] not in {"is", "was", "turned", "set"}
+        ):
+            states.discard(token)
+    return frozenset(states)
+
+
+def safe_to_merge_near_duplicate(content: str, other: str) -> bool:
+    """Return False for textual signals that can denote a changed fact.
+
+    Dense embeddings blur numeric, temporal, polarity, and lifecycle changes.
+    A difference in any of those signals is therefore an absolute block, not a
+    score penalty.  The caller still applies its cosine threshold afterwards.
+    """
+    if _value_tokens(content) != _value_tokens(other):
+        return False
+    if bool(frozenset(_tokens(content)) & _NEGATION_WORDS) != bool(
+        frozenset(_tokens(other)) & _NEGATION_WORDS
+    ):
+        return False
+    return _state_tokens(content) == _state_tokens(other)
+
+
+def find_write_near_duplicates(
+    conn: sqlite3.Connection,
+    *,
+    content: str,
+    scope: str,
+    query_embedding: np.ndarray,
+    threshold: float,
+    candidate_limit: int,
+    embedding_identity: Optional[str] = None,
+) -> List[NearDuplicateCandidate]:
+    """Find safe write-time near duplicates without scanning a whole scope.
+
+    FTS supplies a bounded lexical candidate set before any vector is decoded.
+    If FTS or stored embeddings are unavailable, this returns no candidates so
+    the write path can retain its exact-match fallback rather than blocking a
+    fact on incomplete embedding work.
+    """
+    terms = tuple(dict.fromkeys(_tokens(content)))
+    vector = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
+    if not terms or vector.size == 0 or not np.isfinite(vector).all():
+        return []
+    if candidate_limit <= 0 or not 0.0 <= threshold <= 1.0:
+        raise ValueError("near-duplicate search configuration is invalid")
+    match_query = " OR ".join(f'"{term}"' for term in terms)
+    identity_clause = ""
+    params: list[object] = [match_query, scope]
+    if embedding_identity is not None:
+        identity_clause = " AND e.embedding_identity = ?"
+        params.append(embedding_identity)
+    params.append(candidate_limit)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT f.fact_id, f.content, f.trust_score, f.created_at,
+                   e.embedding, e.dim
+            FROM facts_fts
+            JOIN facts AS f ON f.fact_id = facts_fts.rowid
+            JOIN fact_embeddings AS e ON e.fact_id = f.fact_id
+            WHERE facts_fts MATCH ? AND f.scope = ?
+              AND f.invalid_at IS NULL AND f.superseded_by IS NULL
+              AND f.conflict_group IS NULL{identity_clause}
+            ORDER BY bm25(facts_fts), f.fact_id
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return []
+
+    vector_norm = float(np.linalg.norm(vector))
+    if vector_norm == 0.0:
+        return []
+    matches: List[NearDuplicateCandidate] = []
+    for row in rows:
+        if int(row["dim"]) != vector.size or not safe_to_merge_near_duplicate(
+            content, str(row["content"])
+        ):
+            continue
+        stored = np.frombuffer(row["embedding"], dtype="<f4")
+        if stored.size != vector.size:
+            continue
+        stored_norm = float(np.linalg.norm(stored))
+        if stored_norm == 0.0:
+            continue
+        cosine = float(np.dot(vector, stored) / (vector_norm * stored_norm))
+        if cosine >= threshold:
+            matches.append(
+                NearDuplicateCandidate(
+                    fact_id=int(row["fact_id"]),
+                    trust_score=float(row["trust_score"]),
+                    created_at=str(row["created_at"]),
+                    cosine=cosine,
+                )
+            )
+    return matches
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +531,7 @@ def execute_merge(
 
 
 def _apply_merge(conn: sqlite3.Connection, plan: MergePlan) -> None:
+    vector_index = SQLiteVecIndex.open_configured(conn, warn=False)
     for cluster in plan.clusters:
         conn.execute(
             "UPDATE facts SET retrieval_count = ?, helpful_count = ?, tags = ? "
@@ -390,6 +546,8 @@ def _apply_merge(conn: sqlite3.Connection, plan: MergePlan) -> None:
         for loser_id in cluster.loser_ids:
             conn.execute("DELETE FROM facts WHERE fact_id = ?", (loser_id,))
             conn.execute("DELETE FROM fact_embeddings WHERE fact_id = ?", (loser_id,))
+            if vector_index is not None:
+                vector_index.delete_in_transaction(loser_id)
             conn.execute("DELETE FROM fact_entities WHERE fact_id = ?", (loser_id,))
     conn.commit()
 

@@ -1,6 +1,6 @@
 """Stdio MCP server exposing enfold as a shared-memory tool set.
 
-Lets other coding agents (Claude Code, Codex CLI) read and write the same
+Lets other coding agents read and write the same
 fact store the Hermes gateway uses in-process, over the Model Context
 Protocol, instead of each agent keeping its own disconnected memory.
 

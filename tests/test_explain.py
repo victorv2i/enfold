@@ -49,8 +49,6 @@ def test_explain_search_breakdown_has_component_scores(make_provider):
 
 
 def test_explain_search_marks_superseded_fact_with_reason(make_provider):
-    import json as _json
-
     provider = make_provider()
     provider._handle_fact_store({
         "action": "add",
@@ -130,6 +128,21 @@ def test_dense_candidates_filter_before_truncation(make_provider):
 
 def test_cli_smoke_prints_breakdown(tmp_path, hp):
     import fake_hermes
+
+    bridge = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from plugins.memory.holographic import HolographicMemoryProvider",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if bridge.returncode:
+        pytest.skip(
+            "enfold.explain standalone smoke test requires an importable Hermes "
+            "holographic bridge in the subprocess environment"
+        )
 
     db_path = tmp_path / "facts.db"
     store = fake_hermes.MemoryStore(db_path=db_path, hrr_dim=64)

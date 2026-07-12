@@ -1,0 +1,132 @@
+{
+  "arena_version": "1.0",
+  "description": "Offline synthetic acceptance cases for Enfold's bounded v1 prompt-context fast lane.",
+  "facts": [
+    {
+      "key": "atlas-stale",
+      "content": "Atlas backup schedule runs Monday at 02:00 UTC.",
+      "scope": "private",
+      "source_authority": 0.8,
+      "state": {
+        "subject_key": "atlas",
+        "predicate_key": "backup_schedule",
+        "object_value": "monday",
+        "valid_from": "2026-07-10T10:00:00Z"
+      }
+    },
+    {
+      "key": "atlas-current",
+      "content": "Atlas backup schedule runs Tuesday at 02:00 UTC.",
+      "scope": "private",
+      "source_authority": 0.8,
+      "state": {
+        "subject_key": "atlas",
+        "predicate_key": "backup_schedule",
+        "object_value": "tuesday",
+        "valid_from": "2026-07-11T10:00:00Z"
+      }
+    },
+    {
+      "key": "unstable-terra",
+      "content": "UnstableAtlas model is Terra.",
+      "scope": "private",
+      "source_authority": 0.8,
+      "state": {
+        "subject_key": "atlas",
+        "predicate_key": "unstable_model",
+        "object_value": "terra",
+        "valid_from": "2026-07-10T10:00:00Z"
+      }
+    },
+    {
+      "key": "unstable-model-z",
+      "content": "UnstableAtlas model is Model Z.",
+      "scope": "private",
+      "source_authority": 0.2,
+      "state": {
+        "subject_key": "atlas",
+        "predicate_key": "unstable_model",
+        "object_value": "model-z",
+        "valid_from": "2026-07-11T10:00:00Z"
+      }
+    },
+    {
+      "key": "private-registry",
+      "content": "CedarContext registry has the private endpoint.",
+      "scope": "private"
+    },
+    {
+      "key": "work-registry",
+      "content": "CedarContext registry has the work endpoint.",
+      "scope": "work"
+    },
+    {
+      "key": "verbose-note",
+      "content": "Verbose context memo keeps deterministic budget behavior visible while this deliberately long synthetic sentence repeats enough harmless detail to require stable truncation in the prompt-context fast lane. Verbose context memo keeps deterministic budget behavior visible while this deliberately long synthetic sentence repeats enough harmless detail to require stable truncation in the prompt-context fast lane. Verbose context memo keeps deterministic budget behavior visible while this deliberately long synthetic sentence repeats enough harmless detail to require stable truncation in the prompt-context fast lane. Verbose context memo keeps deterministic budget behavior visible while this deliberately long synthetic sentence repeats enough harmless detail to require stable truncation in the prompt-context fast lane.",
+      "scope": "private"
+    }
+  ],
+  "cases": [
+    {
+      "id": "current-state-excludes-stale",
+      "query": "Atlas backup schedule",
+      "scope": "private",
+      "token_budget": 256,
+      "expected_fact_keys": ["atlas-current"],
+      "forbidden_fact_keys": ["atlas-stale"],
+      "abstained": false,
+      "require_attribution": true
+    },
+    {
+      "id": "unresolved-conflict-abstains",
+      "query": "UnstableAtlas model",
+      "scope": "private",
+      "token_budget": 256,
+      "expected_fact_keys": [],
+      "forbidden_fact_keys": ["unstable-terra", "unstable-model-z"],
+      "abstained": true,
+      "require_attribution": false
+    },
+    {
+      "id": "private-scope-excludes-work",
+      "query": "CedarContext registry",
+      "scope": "private",
+      "token_budget": 256,
+      "expected_fact_keys": ["private-registry"],
+      "forbidden_fact_keys": ["work-registry"],
+      "abstained": false,
+      "require_attribution": true
+    },
+    {
+      "id": "work-scope-excludes-private",
+      "query": "CedarContext registry",
+      "scope": "work",
+      "token_budget": 256,
+      "expected_fact_keys": ["work-registry"],
+      "forbidden_fact_keys": ["private-registry"],
+      "abstained": false,
+      "require_attribution": true
+    },
+    {
+      "id": "budget-truncates-deterministically",
+      "query": "Verbose context memo",
+      "scope": "private",
+      "token_budget": 128,
+      "expected_fact_keys": ["verbose-note"],
+      "forbidden_fact_keys": [],
+      "abstained": false,
+      "require_attribution": true,
+      "require_truncation": true
+    },
+    {
+      "id": "budget-can-abstain",
+      "query": "Verbose context memo",
+      "scope": "private",
+      "token_budget": 16,
+      "expected_fact_keys": [],
+      "forbidden_fact_keys": ["verbose-note"],
+      "abstained": true,
+      "require_attribution": false
+    }
+  ]
+}

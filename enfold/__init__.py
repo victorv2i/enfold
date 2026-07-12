@@ -59,14 +59,44 @@ from __future__ import annotations
 import logging
 import random
 import re
+import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List, Optional
 
-from plugins.memory.holographic import HolographicMemoryProvider
 from .embeddings import FastEmbedder, OllamaEmbedder
+
+
+class HermesAdapterUnavailableError(RuntimeError):
+    """The optional Hermes holographic adapter is not installed."""
+
+
+_HERMES_IMPORT_ERROR: ModuleNotFoundError | None = None
+try:
+    from plugins.memory.holographic import HolographicMemoryProvider
+except ModuleNotFoundError as exc:
+    # ``enfold`` is also a standalone public package.  Importing a package
+    # always executes __init__ before a requested submodule, so an
+    # unconditional Hermes import made even `enfold.core_store` unusable on a
+    # clean installation.  Only the optional parent namespace is suppressed;
+    # a missing dependency inside an installed parent still fails normally.
+    if exc.name != "plugins" and not (exc.name or "").startswith("plugins."):
+        raise
+    _HERMES_IMPORT_ERROR = exc
+
+    class HolographicMemoryProvider:  # type: ignore[no-redef]
+        """Sentinel base that keeps the optional adapter export importable."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise HermesAdapterUnavailableError(
+                "Enfold's Hermes adapter requires the Hermes holographic memory "
+                "provider; standalone storage and operations remain available"
+            ) from _HERMES_IMPORT_ERROR
+
+
+_HERMES_ADAPTER_AVAILABLE = _HERMES_IMPORT_ERROR is None
 
 
 # --- Near-duplicate detection (write-time dedup guard) -----------------------
@@ -236,13 +266,24 @@ def _is_superseded(content: str) -> bool:
     return (content or "").lstrip().lower().startswith(_SUPERSEDED_PREFIXES)
 
 
-from .embed_store import EmbedStore
-from .extract_queue import ExtractQueue, is_quota_error, quota_retry_delay
-from .llm_extract import _format_conversation, extract_facts_from_transcript, insert_facts
-from .reflection import ensure_reflection_schema, invalidate_insights_citing, run_reflection
-from .retrieval_plus import PlusFactRetriever
-from .temporal import ensure_temporal_schema, fact_history, find_value_update_target, supersede
-from .write_lock import cross_process_write_lock
+from .embed_store import EmbedStore  # noqa: E402
+from .extract_queue import ExtractQueue, is_quota_error, quota_retry_delay  # noqa: E402
+from .llm_extract import _format_conversation, extract_facts_from_transcript, insert_facts  # noqa: E402
+from .reflection import ensure_reflection_schema, invalidate_insights_citing, run_reflection  # noqa: E402
+from .schema import SchemaError, schema_version  # noqa: E402
+if _HERMES_ADAPTER_AVAILABLE:
+    from .retrieval_plus import PlusFactRetriever
+else:
+    class PlusFactRetriever:  # type: ignore[no-redef]
+        """Unavailable optional Hermes retriever export."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise HermesAdapterUnavailableError(
+                "PlusFactRetriever requires the optional Hermes holographic "
+                "memory provider"
+            ) from _HERMES_IMPORT_ERROR
+from .temporal import ensure_temporal_schema, fact_history, find_value_update_target, supersede  # noqa: E402
+from .write_lock import cross_process_write_lock  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -535,6 +576,35 @@ class EnfoldProvider(HolographicMemoryProvider):
         connection from a previous initialize() are shut down first so nothing
         leaks across gateway session re-inits.
         """
+        # This in-process provider is the legacy v0 writer.  A versioned v1
+        # database belongs to the standalone service, whose transactional
+        # write/provenance contract this adapter cannot emulate.  Inspect the
+        # ledger read-only and fail before the parent opens or modifies the DB;
+        # migration is an explicit maintenance operation, never startup work.
+        db_path = str(self._config.get("db_path", ""))
+        if db_path:
+            try:
+                probe = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            except sqlite3.OperationalError as exc:
+                if "unable to open" not in str(exc).lower():
+                    raise
+            else:
+                try:
+                    version = schema_version(probe)
+                except SchemaError as exc:
+                    raise RuntimeError(
+                        "Enfold legacy provider refused database startup because "
+                        f"the schema ledger is invalid: {exc}"
+                    ) from exc
+                finally:
+                    probe.close()
+                if version != 0:
+                    raise RuntimeError(
+                        "Enfold legacy provider is a schema-v0 writer and cannot "
+                        f"write schema v{version}; route this database through the "
+                        "standalone Enfold service. No migration was attempted."
+                    )
+
         prev_store = self._store
         prev_quiescent = self._teardown_background()
         super().initialize(session_id, **kwargs)
@@ -1184,7 +1254,16 @@ class EnfoldProvider(HolographicMemoryProvider):
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes + embed them."""
-        super().on_memory_write(action, target, content)
+        db_path = self._write_lock_db_path(self._store)
+        lock_ctx = (
+            cross_process_write_lock(db_path)
+            if db_path is not None
+            else nullcontext()
+        )
+        # The parent performs the canonical fact write.  Take the same
+        # reentrant sidecar used by native tools and MCP before entering it.
+        with lock_ctx:
+            super().on_memory_write(action, target, content)
 
         if action == "add" and self._embed_on_add and content and self._embedder_available:
             # Find the fact_id that was just inserted (content is UNIQUE in the

@@ -1,0 +1,9 @@
+{"id":"sample-current-date","query":"When does the fictional Atlas initiative launch?","expected_fact_ids":[101],"forbidden_content_regexes":["retired Atlas launch"],"category":"project","asof":"2026-07"}
+{"id":"sample-paraphrase","query":"Who runs the imaginary release checklist?","expected_content_regexes":["Mina owns the Atlas release checklist"],"category":"project"}
+{"id":"sample-temporal","query":"What changed during fictional July planning?","expected_fact_ids":[103],"category":"project","asof":"2026-07"}
+{"id":"sample-entity","query":"What is in Mina's imagined project dossier?","expected_content_regexes":["Mina"],"category":"project"}
+{"id":"sample-abstain-1","query":"What is the budget for fictional Project Zaffre?","category":"project"}
+{"id":"sample-abstain-2","query":"Which airline does imaginary Kestrel use?","category":"user_pref"}
+{"id":"sample-cross-client","query":"What did fictional client-a record about Atlas?","expected_fact_ids":[104],"category":"project"}
+{"id":"sample-current-choice","query":"Which fictional editor setting is active?","expected_content_regexes":["current editor setting"],"forbidden_content_regexes":["old editor setting"],"category":"user_pref"}
+{"id":"sample-dossier","query":"What decision belongs to the fictional Enfold dossier?","expected_fact_ids":[105],"category":"project"}

@@ -1,0 +1,385 @@
+{
+  "arena_version": "1.0",
+  "description": "Privacy-safe synthetic cases for testing difficult shared-agent memory retrieval shapes.",
+  "memory_state": {
+    "current_fact_ids": [1001, 1002, 1101, 1103, 1201, 1203, 1301, 1302, 1303, 1304, 1401, 1403, 1601, 1602, 1603, 1604],
+    "supersessions": [
+      {"stale_fact_id": 1102, "current_fact_id": 1101, "subject_key": "atlas", "predicate_key": "backup_schedule"},
+      {"stale_fact_id": 1104, "current_fact_id": 1103, "subject_key": "nimbus", "predicate_key": "deployment_branch"},
+      {"stale_fact_id": 1202, "current_fact_id": 1201, "subject_key": "comet", "predicate_key": "worker_runtime"},
+      {"stale_fact_id": 1204, "current_fact_id": 1203, "subject_key": "harbor", "predicate_key": "alert_channel"},
+      {"stale_fact_id": 1402, "current_fact_id": 1401, "subject_key": "mira", "predicate_key": "studio_transport_preference"},
+      {"stale_fact_id": 1404, "current_fact_id": 1403, "subject_key": "sol", "predicate_key": "project_summary_preference"}
+    ],
+    "conflict_groups": [
+      {"conflict_id": "maple-support-end", "subject_key": "maple", "predicate_key": "support_coverage_end", "fact_ids": [1301, 1302]},
+      {"conflict_id": "aster-launch-status", "subject_key": "aster", "predicate_key": "launch_decision_status", "fact_ids": [1303, 1304]}
+    ]
+  },
+  "facts": [
+    {
+      "fact_id": 1001,
+      "content": "Project Orion stores compiled release bundles in the Cedar registry.",
+      "category": "project",
+      "trust_score": 0.9,
+      "tags": ["orion", "artifacts", "synthetic"]
+    },
+    {
+      "fact_id": 1002,
+      "content": "Juniper team retrospectives are held in the Lantern room.",
+      "category": "work",
+      "trust_score": 0.9,
+      "tags": ["juniper", "meeting", "synthetic"]
+    },
+    {
+      "fact_id": 1101,
+      "content": "The current Atlas backup schedule runs every Tuesday at 02:00 UTC.",
+      "category": "system_state",
+      "trust_score": 0.9,
+      "tags": ["atlas", "backup", "current", "synthetic"]
+    },
+    {
+      "fact_id": 1102,
+      "content": "The Atlas backup schedule used to run every Monday at 02:00 UTC.",
+      "category": "system_state",
+      "trust_score": 0.9,
+      "tags": ["atlas", "backup", "historical", "synthetic"]
+    },
+    {
+      "fact_id": 1103,
+      "content": "Nimbus currently deploys from the main branch.",
+      "category": "project",
+      "trust_score": 0.9,
+      "tags": ["nimbus", "deployment", "current", "synthetic"]
+    },
+    {
+      "fact_id": 1104,
+      "content": "Nimbus previously deployed from the stable branch.",
+      "category": "project",
+      "trust_score": 0.9,
+      "tags": ["nimbus", "deployment", "historical", "synthetic"]
+    },
+    {
+      "fact_id": 1201,
+      "content": "The current Comet worker runtime is Quartz 4.",
+      "category": "system_state",
+      "trust_score": 0.95,
+      "tags": ["comet", "runtime", "current", "synthetic"]
+    },
+    {
+      "fact_id": 1202,
+      "content": "The former Comet worker runtime was Amber 2.",
+      "category": "system_state",
+      "trust_score": 0.95,
+      "tags": ["comet", "runtime", "stale", "synthetic"]
+    },
+    {
+      "fact_id": 1203,
+      "content": "The current Harbor alert channel is #harbor-ops.",
+      "category": "system_state",
+      "trust_score": 0.95,
+      "tags": ["harbor", "alerts", "current", "synthetic"]
+    },
+    {
+      "fact_id": 1204,
+      "content": "Harbor alerts were formerly sent to #general-alerts.",
+      "category": "system_state",
+      "trust_score": 0.95,
+      "tags": ["harbor", "alerts", "stale", "synthetic"]
+    },
+    {
+      "fact_id": 1301,
+      "content": "The signed Maple vendor record says support coverage ends on September 30.",
+      "category": "work",
+      "trust_score": 0.8,
+      "tags": ["maple", "contract", "conflict", "synthetic"]
+    },
+    {
+      "fact_id": 1302,
+      "content": "The Maple account portal says support coverage ends on October 31.",
+      "category": "work",
+      "trust_score": 0.8,
+      "tags": ["maple", "contract", "conflict", "synthetic"]
+    },
+    {
+      "fact_id": 1303,
+      "content": "Aster's planning note marks the launch decision as approved.",
+      "category": "decision",
+      "trust_score": 0.8,
+      "tags": ["aster", "decision", "conflict", "synthetic"]
+    },
+    {
+      "fact_id": 1304,
+      "content": "Aster's review log marks the launch decision as pending.",
+      "category": "decision",
+      "trust_score": 0.8,
+      "tags": ["aster", "decision", "conflict", "synthetic"]
+    },
+    {
+      "fact_id": 1401,
+      "content": "Mira now prefers walking to the studio when the weather is clear.",
+      "category": "user_pref",
+      "trust_score": 0.9,
+      "tags": ["mira", "transport", "current", "synthetic"]
+    },
+    {
+      "fact_id": 1402,
+      "content": "Mira used to prefer taking the subway to the studio.",
+      "category": "user_pref",
+      "trust_score": 0.9,
+      "tags": ["mira", "transport", "historical", "synthetic"]
+    },
+    {
+      "fact_id": 1403,
+      "content": "Sol now prefers concise weekly project summaries.",
+      "category": "user_pref",
+      "trust_score": 0.9,
+      "tags": ["sol", "reporting", "current", "synthetic"]
+    },
+    {
+      "fact_id": 1404,
+      "content": "Sol previously preferred detailed daily project summaries.",
+      "category": "user_pref",
+      "trust_score": 0.9,
+      "tags": ["sol", "reporting", "historical", "synthetic"]
+    },
+    {
+      "fact_id": 1601,
+      "content": "The Aurora workshop will take place in Berlin.",
+      "category": "event",
+      "trust_score": 0.9,
+      "tags": ["aurora", "workshop", "location", "synthetic"]
+    },
+    {
+      "fact_id": 1602,
+      "content": "The Aurora workshop begins on October 14.",
+      "category": "event",
+      "trust_score": 0.9,
+      "tags": ["aurora", "workshop", "date", "synthetic"]
+    },
+    {
+      "fact_id": 1603,
+      "content": "The Zephyr migration requires a database snapshot.",
+      "category": "project",
+      "trust_score": 0.9,
+      "tags": ["zephyr", "migration", "snapshot", "synthetic"]
+    },
+    {
+      "fact_id": 1604,
+      "content": "The Zephyr migration requires a maintenance window.",
+      "category": "project",
+      "trust_score": 0.9,
+      "tags": ["zephyr", "migration", "maintenance", "synthetic"]
+    }
+  ],
+  "cases": [
+    {
+      "id": "paraphrase-orion-artifacts",
+      "query": "Which registry holds Orion's release bundles?",
+      "gold_fact_id": 1001,
+      "category": "project",
+      "case_type": "paraphrase",
+      "tags": ["paraphrase", "public-arena"],
+      "entity_refs": ["Project Orion", "Cedar registry"],
+      "difficulty": "medium",
+      "generation": "hand",
+      "privacy_tier": "public",
+      "provenance": {"source_type": "synthetic_fixture"}
+    },
+    {
+      "id": "paraphrase-juniper-retro",
+      "query": "Where does the Juniper group conduct its retrospective meeting?",
+      "gold_fact_id": 1002,
+      "category": "work",
+      "case_type": "paraphrase",
+      "tags": ["paraphrase", "public-arena"],
+      "entity_refs": ["Juniper", "Lantern room"],
+      "difficulty": "medium",
+      "generation": "hand",
+      "privacy_tier": "public",
+      "provenance": {"source_type": "synthetic_fixture"}
+    },
+    {
+      "id": "current-atlas-schedule",
+      "query": "When does the current Atlas backup run?",
+      "gold_fact_id": 1101,
+      "category": "system_state",
+      "case_type": "current_state_update",
+      "expected_current_fact_ids": [1101],
+      "stale_fact_ids": [1102],
+      "tags": ["temporal", "update", "public-arena"],
+      "entity_refs": ["Atlas"],
+      "difficulty": "hard",
+      "generation": "hand",
+      "privacy_tier": "public",
+      "provenance": {"source_type": "synthetic_fixture"},
+      "answer_rubric": {"must_mention": ["Tuesday", "02:00 UTC"], "must_not_mention": ["Monday"]}
+    },
+    {
+      "id": "current-nimbus-branch",
+      "query": "Which branch currently deploys Nimbus?",
+      "gold_fact_id": 1103,
+      "category": "project",
+      "case_type": "current_state_update",
+      "expected_current_fact_ids": [1103],
+      "stale_fact_ids": [1104],
+      "tags": ["temporal", "update", "public-arena"],
+      "entity_refs": ["Nimbus"],
+      "difficulty": "hard",
+      "generation": "hand",
+      "privacy_tier": "public",
+      "provenance": {"source_type": "synthetic_fixture"},
+      "answer_rubric": {"must_mention": ["main"], "must_not_mention": ["stable"]}
+    },
+    {
+      "id": "stale-comet-runtime",
+      "query": "What runtime should a Comet worker use now?",
+      "gold_fact_id": 1201,
+      "category": "system_state",
+      "case_type": "stale_fact_exclusion",
+      "expected_current_fact_ids": [1201],
+      "stale_fact_ids": [1202],
+      "tags": ["stale", "current-truth", "public-arena"],
+      "entity_refs": ["Comet"],
+      "difficulty": "hard",
+      "generation": "hand",
+      "privacy_tier": "public",
+      "provenance": {"source_type": "synthetic_fixture"},
+      "answer_rubric": {"must_mention": ["Quartz 4"], "must_not_mention": ["Amber 2"]}
+    },
+    {
+      "id": "stale-harbor-channel",
+      "query": "Where should Harbor alerts be sent today?",
+      "gold_fact_id": 1203,
+      "category": "system_state",
+      "case_type": "stale_fact_exclusion",
+      "expected_current_fact_ids": [1203],
+      "stale_fact_ids": [1204],
+      "tags": ["stale", "current-truth", "public-arena"],
+      "entity_refs": ["Harbor"],
+      "difficulty": "hard",
+      "generation": "hand",
+      "privacy_tier": "public",
+      "provenance": {"source_type": "synthetic_fixture"},
+      "answer_rubric": {"must_mention": ["#harbor-ops"], "must_not_mention": ["#general-alerts"]}
+    },
+    {
+      "id": "conflict-maple-coverage",
+      "query": "When does Maple support coverage end?",
+      "gold_fact_id": 1301,
+      "category": "work",
+      "case_type": "contradiction",
+      "expected_current_fact_ids": [1301, 1302],
+      "tags": ["contradiction", "public-arena"],
+      "entity_refs": ["Maple"],
+      "difficulty": "hard",
+      "generation": "hand",
+      "privacy_tier": "public",
+      "provenance": {"source_type": "synthetic_fixture"},
+      "answer_rubric": {"must_mention": ["September 30", "October 31", "conflict"]}
+    },
+    {
+      "id": "conflict-aster-decision",
+      "query": "What is the status of Aster's launch decision?",
+      "gold_fact_id": 1303,
+      "category": "decision",
+      "case_type": "contradiction",
+      "expected_current_fact_ids": [1303, 1304],
+      "tags": ["contradiction", "public-arena"],
+      "entity_refs": ["Aster"],
+      "difficulty": "hard",
+      "generation": "hand",
+      "privacy_tier": "public",
+      "provenance": {"source_type": "synthetic_fixture"},
+      "answer_rubric": {"must_mention": ["approved", "pending", "conflict"]}
+    },
+    {
+      "id": "preference-mira-transport",
+      "query": "How does Mira currently prefer to reach the studio?",
+      "gold_fact_id": 1401,
+      "category": "user_pref",
+      "case_type": "changed_preference",
+      "expected_current_fact_ids": [1401],
+      "stale_fact_ids": [1402],
+      "tags": ["preference", "temporal", "public-arena"],
+      "entity_refs": ["Mira"],
+      "difficulty": "hard",
+      "generation": "hand",
+      "privacy_tier": "public",
+      "provenance": {"source_type": "synthetic_fixture"},
+      "answer_rubric": {"must_mention": ["walking"], "must_not_mention": ["subway"]}
+    },
+    {
+      "id": "preference-sol-summary",
+      "query": "What kind of project update does Sol want now?",
+      "gold_fact_id": 1403,
+      "category": "user_pref",
+      "case_type": "changed_preference",
+      "expected_current_fact_ids": [1403],
+      "stale_fact_ids": [1404],
+      "tags": ["preference", "temporal", "public-arena"],
+      "entity_refs": ["Sol"],
+      "difficulty": "hard",
+      "generation": "hand",
+      "privacy_tier": "public",
+      "provenance": {"source_type": "synthetic_fixture"},
+      "answer_rubric": {"must_mention": ["concise", "weekly"], "must_not_mention": ["detailed daily"]}
+    },
+    {
+      "id": "abstain-nova-bicycle",
+      "query": "What color is Nova's bicycle?",
+      "gold_fact_id": -1,
+      "case_type": "abstention",
+      "tags": ["unknown", "abstention", "public-arena"],
+      "entity_refs": ["Nova"],
+      "difficulty": "medium",
+      "generation": "hand",
+      "privacy_tier": "public",
+      "should_abstain": true,
+      "provenance": {"source_type": "synthetic_fixture"}
+    },
+    {
+      "id": "abstain-ember-budget",
+      "query": "What budget was approved for Project Ember?",
+      "gold_fact_id": -1,
+      "case_type": "abstention",
+      "tags": ["unknown", "abstention", "public-arena"],
+      "entity_refs": ["Project Ember"],
+      "difficulty": "medium",
+      "generation": "hand",
+      "privacy_tier": "public",
+      "should_abstain": true,
+      "provenance": {"source_type": "synthetic_fixture"}
+    },
+    {
+      "id": "multi-aurora-workshop",
+      "query": "Where and when is the Aurora workshop?",
+      "gold_fact_id": 1601,
+      "category": "event",
+      "case_type": "multi_fact_retrieval",
+      "expected_current_fact_ids": [1601, 1602],
+      "tags": ["multi-fact", "public-arena"],
+      "entity_refs": ["Aurora"],
+      "difficulty": "hard",
+      "generation": "hand",
+      "privacy_tier": "public",
+      "provenance": {"source_type": "synthetic_fixture"},
+      "answer_rubric": {"must_mention": ["Berlin", "October 14"]}
+    },
+    {
+      "id": "multi-zephyr-migration",
+      "query": "What must happen before the Zephyr migration?",
+      "gold_fact_id": 1603,
+      "category": "project",
+      "case_type": "multi_fact_retrieval",
+      "expected_current_fact_ids": [1603, 1604],
+      "tags": ["multi-fact", "public-arena"],
+      "entity_refs": ["Zephyr"],
+      "difficulty": "hard",
+      "generation": "hand",
+      "privacy_tier": "public",
+      "provenance": {"source_type": "synthetic_fixture"},
+      "answer_rubric": {"must_mention": ["database snapshot", "maintenance window"]}
+    }
+  ]
+}

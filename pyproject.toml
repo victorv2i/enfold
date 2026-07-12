@@ -4,20 +4,30 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "enfold"
-version = "0.7.0"
-description = "Enfold memory: local holographic SQLite fact store with FastEmbed dense retrieval, a persistent LLM fact-extraction queue, and debounced bank rebuilds."
+version = "0.8.0"
+description = "Local-first shared memory for AI agents over MCP, with SQLite provenance and optional extraction."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = ["numpy"]
 
+[project.scripts]
+enfold-mcp-proxy = "enfold.mcp_stdio:main"
+enfold-mcp-launch = "enfold.mcp_launcher:main"
+enfold-ollama-extractor = "enfold.ollama_extractor_child:main"
+enfold-server = "enfold.server:main"
+
 [project.optional-dependencies]
 mcp = ["mcp"]
 fastembed = ["fastembed"]
-test = ["pytest"]
+sqlite-vec = ["sqlite-vec==0.1.9"]
+test = ["pytest", "mcp"]
 
 [tool.setuptools]
 packages = ["enfold", "memory_eval"]
+
+[tool.setuptools.package-data]
+memory_eval = ["fixtures/*.json", "fixtures/*.jsonl", "fixtures/*.md"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

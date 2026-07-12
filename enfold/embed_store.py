@@ -29,6 +29,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from .embeddings import bytes_to_embedding, embedding_to_bytes
+from .sqlite_vec_index import SQLiteVecIndex
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,7 @@ class EmbedStore:
         self._cache_dim: Optional[int] = None
         self._cache_identity: Optional[str] = None
         self._init_table()
+        self._vector_index = SQLiteVecIndex.open_configured(conn, warn=False)
 
     def _invalidate_cache(self) -> None:
         """Drop the in-process embedding matrix cache after writes."""
@@ -167,28 +169,46 @@ class EmbedStore:
             identity = embedding_identity if embedding_identity is not None else self._embedding_identity
             if not identity:
                 identity = "legacy:unknown:document:none:v1"
-            self._conn.execute(
-                """
-                INSERT INTO fact_embeddings (fact_id, embedding, dim, embedding_identity)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(fact_id, embedding_identity) DO UPDATE SET
-                    embedding  = excluded.embedding,
-                    dim        = excluded.dim,
-                    embedding_identity = excluded.embedding_identity,
-                    created_at = CURRENT_TIMESTAMP
-                """,
-                (fact_id, blob, dim, identity),
-            )
-            self._conn.commit()
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO fact_embeddings (fact_id, embedding, dim, embedding_identity)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(fact_id, embedding_identity) DO UPDATE SET
+                        embedding  = excluded.embedding,
+                        dim        = excluded.dim,
+                        embedding_identity = excluded.embedding_identity,
+                        created_at = CURRENT_TIMESTAMP
+                    """,
+                    (fact_id, blob, dim, identity),
+                )
+                if (
+                    self._vector_index is not None
+                    and identity == self._vector_index.identity
+                    and dim == self._vector_index.dimensions
+                ):
+                    self._vector_index.upsert_in_transaction(fact_id, blob)
+                self._conn.commit()
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
             self._invalidate_cache()
 
     def delete(self, fact_id: int) -> None:
         """Remove embedding for *fact_id* (no-op if not present)."""
         with self._lock:
-            self._conn.execute(
-                "DELETE FROM fact_embeddings WHERE fact_id = ?", (fact_id,)
-            )
-            self._conn.commit()
+            try:
+                self._conn.execute(
+                    "DELETE FROM fact_embeddings WHERE fact_id = ?", (fact_id,)
+                )
+                if self._vector_index is not None:
+                    self._vector_index.delete_in_transaction(fact_id)
+                self._conn.commit()
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
             self._invalidate_cache()
 
     def prune_identities(self, keep) -> int:
@@ -205,12 +225,22 @@ class EmbedStore:
             raise ValueError("prune_identities requires a non-empty keep set")
         with self._lock:
             placeholders = ",".join("?" * len(keep_list))
-            cur = self._conn.execute(
-                f"DELETE FROM fact_embeddings "
-                f"WHERE embedding_identity NOT IN ({placeholders})",
-                keep_list,
-            )
-            self._conn.commit()
+            try:
+                cur = self._conn.execute(
+                    f"DELETE FROM fact_embeddings "
+                    f"WHERE embedding_identity NOT IN ({placeholders})",
+                    keep_list,
+                )
+                if (
+                    self._vector_index is not None
+                    and self._vector_index.identity not in keep_list
+                ):
+                    self._vector_index.clear_in_transaction()
+                self._conn.commit()
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
             deleted = int(cur.rowcount)
             if deleted:
                 self._invalidate_cache()

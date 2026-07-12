@@ -199,7 +199,12 @@ def run_retrieval_cases(provider: SearchProvider, cases: list[EvalCase], *, limi
     results: list[EvalResult] = []
     for case in cases:
         started = time.perf_counter()
-        rows = provider.search(
+        search = provider.search
+        if case.case_type == "contradiction":
+            conflict_search = getattr(provider, "search_conflicts", None)
+            if callable(conflict_search):
+                search = conflict_search
+        rows = search(
             case.query,
             category=case.category,
             min_trust=case.min_trust,

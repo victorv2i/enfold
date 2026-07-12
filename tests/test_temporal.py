@@ -18,8 +18,6 @@ import sys
 import threading
 import types
 
-import pytest
-
 from enfold.temporal import (
     ensure_temporal_schema,
     _is_value_update,
@@ -298,6 +296,38 @@ def test_cross_process_write_lock_is_reentrant_for_same_db_path(hp, tmp_path):
     assert (tmp_path / "facts.db.mcp-write.lock").exists()
 
 
+def test_legacy_builtin_memory_hook_takes_shared_write_lock(
+    make_provider, hp, monkeypatch
+):
+    provider = make_provider()
+    depth = 0
+    events = []
+
+    @contextlib.contextmanager
+    def fake_lock(db_path):
+        nonlocal depth
+        assert db_path == str(Path(provider._store.db_path).expanduser().resolve())
+        depth += 1
+        events.append("enter")
+        try:
+            yield
+        finally:
+            depth -= 1
+            events.append("exit")
+
+    def checked_parent_write(self, action, target, content):
+        assert self is provider
+        assert depth == 1
+        events.append("parent-write")
+
+    monkeypatch.setattr(hp, "cross_process_write_lock", fake_lock)
+    monkeypatch.setattr(
+        hp.HolographicMemoryProvider, "on_memory_write", checked_parent_write
+    )
+    provider.on_memory_write("add", "memory", "serialized host write")
+    assert events == ["enter", "parent-write", "exit"]
+
+
 def test_fact_history_returns_full_chain_from_any_link():
     conn = _conn()
     ensure_temporal_schema(conn)
@@ -457,8 +487,6 @@ def test_interactive_add_holds_write_lock_through_supersede(make_provider, hp, m
 
 
 def test_search_excludes_superseded_facts_by_default(make_provider):
-    import json
-
     provider = make_provider()
     provider._handle_fact_store({
         "action": "add",
@@ -478,8 +506,6 @@ def test_search_excludes_superseded_facts_by_default(make_provider):
 
 
 def test_temporal_filter_off_preserves_old_behaviour(make_provider):
-    import json
-
     provider = make_provider(temporal_filter=False)
     provider._handle_fact_store({
         "action": "add",

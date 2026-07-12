@@ -84,6 +84,12 @@ def test_queue_drain_dedupes_extracted_facts_against_existing_store(
 
 def test_queue_drain_retries_when_fact_insert_fails(make_provider, aux_module):
     provider = make_provider(**_extraction_cfg())
+    # This test drives one drain synchronously.  Quiesce the daemon worker
+    # first so it cannot reclaim the retry row between our assertion reads.
+    provider._queue_stop.set()
+    provider._queue_wake.set()
+    provider._queue_worker.join(timeout=1)
+    assert not provider._queue_worker.is_alive()
     provider._queue_max_attempts = 3
     provider._extract_drain_batch = 1
     aux_module.call_llm = lambda **kwargs: _llm_response(json.dumps([

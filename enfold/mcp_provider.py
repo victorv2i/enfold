@@ -37,9 +37,15 @@ DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_OLLAMA_MODEL = "embeddinggemma:latest"
 DEFAULT_PREFIX_POLICY = "auto"
 DEFAULT_BUSY_TIMEOUT_MS = 5000
+LEGACY_WRITER_SCHEMA_VERSION = 0
+SERVICE_SCHEMA_VERSION = 1
 
 _PARENT_PKG = "plugins.memory.holographic"
 _MODULE_RESTORE_PREFIXES = ("agent", "plugins", "hermes_state")
+
+
+class LegacySchemaCompatibilityError(RuntimeError):
+    """The legacy MCP provider cannot safely open this schema mode."""
 
 
 def _canonical_db_path(db_path: str) -> str:
@@ -48,6 +54,69 @@ def _canonical_db_path(db_path: str) -> str:
 
 def _sqlite_readonly_uri(db_path: str) -> str:
     return f"file:{quote(_canonical_db_path(db_path), safe='/')}?mode=ro"
+
+
+def _inspect_recorded_schema(db_path: str) -> int:
+    """Read the version ledger without creating or migrating the database."""
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return 0
+    conn = sqlite3.connect(_sqlite_readonly_uri(str(path)), uri=True)
+    try:
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('schema_migrations', 'enfold_meta')"
+            )
+        }
+        if not tables:
+            return 0
+        if tables != {"schema_migrations", "enfold_meta"}:
+            raise LegacySchemaCompatibilityError(
+                "incomplete Enfold schema ledger; no migration was attempted"
+            )
+        ledger = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+        meta = conn.execute(
+            "SELECT value FROM enfold_meta WHERE key='schema_version'"
+        ).fetchone()
+        if not ledger or ledger[0] is None or meta is None:
+            raise LegacySchemaCompatibilityError(
+                "missing Enfold schema version record; no migration was attempted"
+            )
+        try:
+            ledger_version = int(ledger[0])
+            meta_version = int(meta[0])
+        except (TypeError, ValueError) as exc:
+            raise LegacySchemaCompatibilityError(
+                "invalid Enfold schema version record; no migration was attempted"
+            ) from exc
+        if ledger_version != meta_version:
+            raise LegacySchemaCompatibilityError(
+                "Enfold schema version records disagree; no migration was attempted"
+            )
+        return ledger_version
+    finally:
+        conn.close()
+
+
+def _require_legacy_schema_mode(db_path: str, *, read_only: bool) -> int:
+    """Gate legacy MCP startup before any provider initialization occurs."""
+    version = _inspect_recorded_schema(db_path)
+    if version == LEGACY_WRITER_SCHEMA_VERSION:
+        return version
+    mode = "read-only" if read_only else "writable"
+    if version == SERVICE_SCHEMA_VERSION:
+        detail = (
+            "v1 reads and writes require the scoped standalone Enfold service; "
+            "the legacy retriever is scope- and conflict-unaware"
+        )
+    else:
+        detail = "this legacy MCP provider does not support that schema version"
+    raise LegacySchemaCompatibilityError(
+        f"legacy MCP {mode} startup refused schema v{version}: {detail}. "
+        "No migration was attempted."
+    )
 
 
 def _module_snapshot() -> dict[str, Any]:
@@ -214,7 +283,11 @@ def _load_enfold_module():
     """Import the enfold package fresh, bound to whichever parent
     modules resolve_parent_modules() just installed in sys.modules."""
     name = "enfold"
-    if name in sys.modules and hasattr(sys.modules[name], "EnfoldProvider"):
+    if (
+        name in sys.modules
+        and hasattr(sys.modules[name], "EnfoldProvider")
+        and getattr(sys.modules[name], "_HERMES_ADAPTER_AVAILABLE", True)
+    ):
         return sys.modules[name]
     pkg_dir = Path(__file__).resolve().parent
     spec = importlib.util.spec_from_file_location(
@@ -346,11 +419,13 @@ def build_provider(
     The caller owns the returned provider's lifecycle (call ``.shutdown()``
     when done); this mirrors the ``explain.py`` CLI's own usage.
     """
+    canonical_path = _canonical_db_path(db_path)
+    opened_schema_version = _require_legacy_schema_mode(
+        canonical_path, read_only=read_only
+    )
     parent_source = resolve_parent_modules(hermes_src)
     logger.info("enfold MCP: startup parent engine %s", parent_source)
     hp = _load_enfold_module()
-    canonical_path = _canonical_db_path(db_path)
-
     config = {
         "db_path": canonical_path,
         "embedding_backend": embedding_backend if embedding_backend != "fake" else "ollama",
@@ -383,6 +458,7 @@ def build_provider(
     else:
         _initialize_with_retry(provider, session_id)
     _apply_busy_timeout(provider, busy_timeout_ms)
+    provider._enfold_schema_version = opened_schema_version
     return provider
 
 

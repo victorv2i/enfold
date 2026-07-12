@@ -1,6 +1,6 @@
 """Temporal validity: invalidate-not-delete supersession for facts.
 
-Additive-only schema on top of the parent ``facts`` table (Graphiti-inspired,
+Additive-only schema on top of the parent ``facts`` table (graph-inspired,
 no graph DB): a fact is never deleted when it is superseded by a newer value,
 it is marked ``invalid_at`` and linked to its replacement via
 ``superseded_by``, so the history stays queryable. Search excludes invalid

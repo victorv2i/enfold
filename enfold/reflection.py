@@ -1,6 +1,6 @@
 """Sleep-time reflection: the connection-drawing insight layer.
 
-Letta/Honcho-inspired: opportunistically look for related ACTIVE facts that,
+The reflection layer opportunistically looks for related ACTIVE facts that,
 taken together, imply something durable neither one states on its own (e.g.
 two facts about a person's move and new job implying a life transition), and
 store that synthesis as a new fact so retrieval can surface the connection
@@ -43,8 +43,6 @@ import re
 import sqlite3
 import threading
 from typing import Any, Dict, List, Optional
-
-from .llm_extract import _extract_json_array
 
 logger = logging.getLogger(__name__)
 

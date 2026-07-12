@@ -2,8 +2,10 @@
 
 import json
 import sqlite3
+import threading
 import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 
 import fake_hermes
 import pytest
@@ -56,6 +58,79 @@ def test_enqueue_and_fifo_pending(raw_queue):
     assert row["payload"] == "payload one"
     raw_queue.mark_done(first, row["lease_owner"])
     assert raw_queue.next_pending(max_attempts=5)["id"] == second
+
+
+def test_identical_active_payload_is_idempotent(raw_queue):
+    first = raw_queue.enqueue("same transcript")
+    duplicate = raw_queue.enqueue("same transcript")
+
+    assert duplicate == first
+    assert raw_queue.pending_count() == 1
+    assert raw_queue._conn.execute(
+        "SELECT COUNT(*) FROM extract_queue"
+    ).fetchone()[0] == 1
+
+
+def test_identical_concurrent_enqueue_across_connections(hp, tmp_path):
+    db_path = tmp_path / "overlap.db"
+    connections = [
+        sqlite3.connect(str(db_path), check_same_thread=False, timeout=5.0)
+        for _ in range(2)
+    ]
+    queues = [hp.extract_queue.ExtractQueue(conn) for conn in connections]
+    barrier = threading.Barrier(2)
+
+    def enqueue(queue):
+        barrier.wait()
+        return queue.enqueue("overlapping transcript")
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ids = list(pool.map(enqueue, queues))
+        assert ids[0] == ids[1]
+        assert connections[0].execute(
+            "SELECT COUNT(*) FROM extract_queue"
+        ).fetchone()[0] == 1
+    finally:
+        for conn in connections:
+            conn.close()
+
+
+def test_queue_additive_hash_setup_preserves_legacy_duplicates(hp, tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "legacy-queue.db"), check_same_thread=False)
+    conn.executescript(
+        """
+        CREATE TABLE extract_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payload TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            not_before REAL,
+            lease_owner TEXT,
+            lease_until REAL
+        );
+        INSERT INTO extract_queue(payload) VALUES ('legacy duplicate');
+        INSERT INTO extract_queue(payload) VALUES ('legacy duplicate');
+        """
+    )
+    queue = hp.extract_queue.ExtractQueue(conn)
+    try:
+        assert queue.enqueue("legacy duplicate") == 1
+        assert conn.execute("SELECT COUNT(*) FROM extract_queue").fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT COUNT(payload_hash) FROM extract_queue"
+        ).fetchone()[0] == 1
+        first = queue.next_pending(max_attempts=5, lease_owner="worker")
+        assert first["id"] == 1
+        assert queue.mark_done(first["id"], "worker") is True
+        # The remaining legacy duplicate has a NULL hash, but payload lookup
+        # still prevents a third active copy from being created.
+        assert queue.enqueue("legacy duplicate") == 2
+        assert conn.execute("SELECT COUNT(*) FROM extract_queue").fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 def test_next_pending_claims_row_with_lease(raw_queue):
